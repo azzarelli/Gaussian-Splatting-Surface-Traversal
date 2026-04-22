@@ -1,0 +1,659 @@
+try:
+    import dearpygui.dearpygui as dpg
+except:
+    print("No dpg running")
+    dpg = None
+from scene.cameras import Camera
+
+import numpy as np
+import os
+import copy
+import psutil
+import torch
+from gaussian_renderer import render, render_draw_mouse_click
+from tqdm import tqdm
+import time
+import json
+import cv2
+from torchvision import transforms
+import threading
+import time
+
+from scene.draw_gaussians import GaussianModel as DrawGaussians
+
+to_tensor = transforms.ToTensor()  # auto converts HWC uint8 → CHW float32 in [0,1]
+
+def process_Gaussians(pc):
+    means3D = pc.get_xyz
+    colors = pc.get_features
+    
+    opacity = pc.get_opacity
+
+    scales = pc.get_scaling #pc.get_scaling_with_3D_filter
+    
+    rotations = pc.rotation_activation(pc.splats["quats"])
+    
+    return means3D, rotations, opacity, colors, scales
+
+def process_draw_Gaussians(pc):
+    means3D = pc.splats['means']
+    colors = pc.get_features
+    
+    opacity = pc.splats['opacities']
+
+    scales = pc.splats['scales'] #pc.get_scaling_with_3D_filter
+    
+    rotations = pc.splats["quats"]
+    
+    return means3D, rotations, opacity, colors, scales
+
+
+class GUIBase:
+    """This method servers to intialize the DPG visualization (keeping my code cleeeean!)
+    
+        Notes:
+            none yet...
+    """
+    def __init__(self, scene,name):
+        
+        self.gui = True
+        self.scene = scene
+        self.gaussians = scene.gaussians
+        self.drawgaussians = DrawGaussians()
+        self.runname = name
+        
+        # Set the width and height of the expected image
+        self.W, self.H = 1920, 1080
+        
+        # Initialize the image buffer
+        self.buffer_image = np.ones((self.W, self.H, 3), dtype=np.float32)
+        
+        # Other important visualization parameters
+        self.vis_mode = 'render'
+                
+        # Rendering/Novel View Settings
+        self.novel_view_background_dir = ""
+        self.drag_func = "viewing"
+        self.drag_im_buffer = None
+        
+        # Analysis/Inspection tools
+        self.mous_loc = [0, 0] # x,y
+        self.mous_loc_last = [0, 0] # x,y
+        
+        self.design_state = 'add_points' #'viewing'
+        self.scale_adjust = 0.07
+
+        # Viewer settings for camera/view selection
+        self.save_frame=False
+
+        self.camera = Camera(
+            R=[[
+                    -2.821299744937278e-07,
+                    0.9659259915351868,
+                    0.25881895422935486,
+                ],
+                [
+                    1.0,
+                    3.051058001801721e-07,
+                    -4.8603780555822595e-08,
+                ],
+                [
+                    -1.2591478082413232e-07,
+                    0.25881895422935486,
+                    -0.9659259915351868,
+                ]], 
+            T=[[0.,0.,0.]],
+            fx=1866.66, fy=1866.66,
+            cx=960., cy=540.,
+            
+            width=self.W, height=self.H,
+
+            uid=0,
+            data_device=torch.device("cuda"),
+            
+        )
+        
+        
+        if self.gui:
+            print('DPG loading ...')
+            dpg.create_context()
+            self.register_dpg()
+            
+
+    def __del__(self):
+        if self.gui:
+            dpg.destroy_context()
+
+    def track_cpu_gpu_usage(self, time):
+        # Print GPU and CPU memory usage
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / (1024 ** 2)  # Convert to MB
+
+        allocated = torch.cuda.memory_allocated() / (1024 ** 2)  # Convert to MB
+        reserved = torch.cuda.memory_reserved() / (1024 ** 2)  # Convert to MB
+        print(
+            f'[{self.stage} {self.iteration}] Time: {time:.2f} | Allocated Memory: {allocated:.2f} MB, Reserved Memory: {reserved:.2f} MB | CPU Memory Usage: {memory_mb:.2f} MB')
+    
+    def render(self):
+        cnt = 0
+        if self.gui:
+            while dpg.is_dearpygui_running():
+                with torch.no_grad():
+                    self.viewer_step()
+                    dpg.render_dearpygui_frame()    
+
+                    
+                with torch.no_grad():
+                    self.timer.pause() # log and save
+                    torch.cuda.synchronize()
+                    if  1000 == 500: # make it 500 so that we dont run this while loading view-test
+                        self.track_cpu_gpu_usage(0.1)
+                    self.timer.start()
+                    
+            dpg.destroy_context()
+           
+    @torch.no_grad()
+    def viewer_step(self):
+        t0 = time.time()
+        mous_hover_value = [0.]
+
+        cam = self.camera # Need to define CAMERA
+        
+        if self.drawgaussians.splats != None:
+            means, rotations, opacity, colors, scales = process_Gaussians(self.gaussians)
+            means_draw, rotations_draw, opacity_draw, colors_draw, scales_draw = process_draw_Gaussians(self.drawgaussians)
+            
+            scales_draw = scales_draw*0. + self.scale_adjust
+            means = torch.cat([means, means_draw], dim=0)
+            rotations = torch.cat([rotations, rotations_draw], dim=0)
+            opacity = torch.cat([opacity, opacity_draw], dim=0)
+            colors = torch.cat([colors, colors_draw], dim=0)
+            scales = torch.cat([scales, scales_draw], dim=0)
+        else:
+            means, rotations, opacity, colors, scales = process_Gaussians(self.gaussians)
+
+            
+        buffer_image = render(
+                cam,
+                means, rotations, opacity, colors, scales,
+                view_args={
+                    "vis_mode":self.vis_mode,
+                },
+        )
+
+        try:
+            buffer_image = buffer_image["render"]
+        except:
+            print(f'Mode "{self.vis_mode}" does not work')
+            buffer_image = buffer_image['render']
+        
+
+        # Display value of image at current mouse position
+        try:
+            mous_hover_value = buffer_image[:, self.mous_loc[1], self.mous_loc[0]]
+        except:
+            mous_hover_value = [0.]
+        
+        buffer_image = torch.nn.functional.interpolate(
+            buffer_image.unsqueeze(0),
+            size=(self.H,self.W),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+    
+        
+        self.buffer_image = (
+            buffer_image.permute(1, 2, 0)
+            .contiguous()
+            .clamp(0.01, 1)
+            .contiguous()
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        t1 = time.time()
+        buffer_image = self.buffer_image
+
+        if self.save_frame:
+            frame_uint8 = (buffer_image * 255).astype("uint8")
+            frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR)
+            cv2.imwrite("current_frame.png", frame_bgr)
+            self.save_frame = False
+
+        dpg.set_value(
+            "_texture", buffer_image
+        )  # buffer must be contiguous, else seg fault!
+        
+        dpg.set_value("_log_mouse_value", f"({[f'{v:.4f}' for v in mous_hover_value]})")
+
+        # Add _log_view_camera
+        if 1./(t1-t0) < 500:
+            dpg.set_value("_log_infer_time", f"{1./(t1-t0)} ")
+
+    def on_image_click(self, button: int, x: int, y: int):
+        """Override in subclass to handle clicks on the rendered image.
+
+        button: 0=left, 1=right, 2=middle
+        x, y: pixel coordinates in the image
+        """
+        
+        if self.design_state == 'add_points':      
+            mean, scale, quat = render_draw_mouse_click(
+                    self.camera ,
+                    self.gaussians,
+                    x,y
+            )
+            if mean.sum().abs() > 0.0001:
+                scale = scale
+                mean = mean # + 0.003*(torch.from_numpy((self.camera.T)).cuda().float() - mean)
+                self.drawgaussians.add_gaussian(mean, scale, quat, self.gaussians)
+
+    
+    def register_dpg(self):
+        ### register texture
+        with dpg.texture_registry(show=False):
+            dpg.add_raw_texture(
+                self.W,
+                self.H,
+                self.buffer_image,
+                format=dpg.mvFormat_Float_rgb,
+                tag="_texture",
+            )
+
+        ### register window
+        # the rendered image, as the primary window
+        with dpg.window(
+            tag="_primary_window",
+            width=self.W,
+            height=self.H,
+            pos=[0, 0],
+            no_move=True,
+            no_title_bar=True,
+            no_scrollbar=True,
+        ):
+            # add the texture
+            dpg.add_image("_texture")
+            
+        # control window
+        with dpg.window(
+            label="Control",
+            tag="_control_window",
+            width=400,
+            height=self.H,
+            pos=[self.W, 0],
+            no_move=True,
+            no_title_bar=True,
+        ):
+            # button theme
+            with dpg.theme() as theme_button:
+                with dpg.theme_component(dpg.mvButton):
+                    dpg.add_theme_color(dpg.mvThemeCol_Button, (23, 3, 18))
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (51, 3, 47))
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (83, 18, 83))
+                    dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 5)
+                    dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 3, 3)
+
+            # timer stuff
+            with dpg.group(horizontal=True):
+                dpg.add_text("Infer time: ")
+                dpg.add_text("N/A", tag="_log_infer_time")
+            with dpg.group(horizontal=True):
+                dpg.add_text("Stage: ")
+                dpg.add_text("N/A", tag="_log_stage")
+
+            with dpg.group():
+                dpg.add_text("Mode : viewing")
+
+            # ----------------
+            #  Control Functions
+            # ----------------
+            with dpg.collapsing_header(label="Viewer Config", default_open=True):
+                     
+                def callback_toggle_reset_cam(sender):
+                    # TODO: reset camera position
+                    pass
+                
+                def callback_toggle_save_frame(sender):
+                        self.save_frame = True
+                dpg.add_text(": Frame Settings : ")
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="save", callback=callback_toggle_save_frame)
+                    dpg.add_button(label="reset", callback=callback_toggle_reset_cam)
+
+                def callback_toggle_show_rgb(sender):
+                    self.vis_mode = 'render'
+                def callback_toggle_show_depth(sender):
+                    self.vis_mode = 'D'
+                def callback_toggle_show_edepth(sender):
+                    self.vis_mode = 'ED'
+                def callback_toggle_show_2dgsdepth(sender):
+                    self.vis_mode = '2D' 
+                def callback_toggle_show_XYZ(sender):
+                    self.vis_mode = 'xyz'
+
+                dpg.add_text(" : Geometry Buffers : ")
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="RGB", callback=callback_toggle_show_rgb)
+                    dpg.add_button(label="Zc", callback=callback_toggle_show_depth)
+                    dpg.add_button(label="E[Zc]", callback=callback_toggle_show_edepth)
+                    dpg.add_button(label="Zc", callback=callback_toggle_show_2dgsdepth)
+                    dpg.add_button(label="XYZ", callback=callback_toggle_show_XYZ)
+
+            with dpg.collapsing_header(label="Drawing Config", default_open=True):
+                dpg.add_text(": Mouse Click : ")
+
+                def callback_toggle_add_point(sender, app_data):
+                    if self.design_state != 'add_points':
+                        self.design_state = 'add_points'
+                    else:
+                        self.design_state = 'viewing'
+                        
+                def callback_toggle_reset_draw_point(sender, app_data):
+                    self.drawgaussians.reset()
+                    
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Add", callback=callback_toggle_add_point)
+                    dpg.add_button(label="Reset", callback=callback_toggle_reset_draw_point)
+                
+                def callback_scale_adjust(sender, app_data):
+                    self.scale_adjust = float(app_data)
+
+                dpg.add_text(": Scale Adjust : ")
+                dpg.add_slider_float(
+                    label="scale adjust",
+                    tag="_slider_scale_adjust",
+                    default_value=self.scale_adjust,
+                    min_value=0.0,
+                    max_value=0.1,
+                    callback=callback_scale_adjust,
+                )
+                
+        def drag_callback(sender, app_data):
+            if self.drag_im_buffer is not None:
+                mouse_hover_value = self.drag_im_buffer[:3, self.mous_loc[1], self.mous_loc[0]].sum()
+            else:
+                mouse_hover_value = 0.0
+
+            view_drag_thresh = 0.5
+            if mouse_hover_value < view_drag_thresh:
+                button, rel_x, rel_y = app_data
+                cam = self.camera
+
+                yaw_speed   = 0.001
+                pitch_speed = 0.001
+                cam.yaw   -= rel_x * yaw_speed
+                cam.pitch += rel_y * pitch_speed
+                cam.pitch  = np.clip(cam.pitch, -np.pi/2 + 0.01, np.pi/2 - 0.01)  # never hit poles
+
+                # Camera position on sphere around world origin (Z-up)
+                cam.T = np.array([
+                    cam.orbit_radius * np.sin(cam.yaw) * np.cos(cam.pitch),
+                    cam.orbit_radius * np.cos(cam.yaw) * np.cos(cam.pitch),
+                    cam.orbit_radius * np.sin(cam.pitch),
+                ], dtype=np.float32)
+
+                # Look-at with fixed Z-up — no roll ever
+                forward = -cam.T / np.linalg.norm(cam.T)
+                world_up = np.array([0, 0, -1], dtype=np.float32)
+                right = np.cross(forward, world_up)
+                right /= np.linalg.norm(right)
+                up = np.cross(right, forward)
+                up /= np.linalg.norm(up)
+
+                cam.R = np.stack([right, up, forward], axis=1).astype(np.float32)      
+        
+        
+        def zoom_callback_fov(sender, app_data):
+            delta = app_data  # scroll: +1 = up (zoom in), -1 = down (zoom out)
+
+            if delta > 0:
+                self.camera.orbit_radius += 1
+            elif delta < 0:
+                self.camera.orbit_radius = self.camera.orbit_radius - 1 if self.camera.orbit_radius > 1 else 1
+
+            drag_callback(None, (1, 0., 0.))
+        
+        
+        def mouse_hover_callback(sender, app_data):
+            # app_data: (x, y) coordinates of mouse position in global viewport
+            x, y = app_data
+
+            if dpg.is_item_hovered("_primary_window"):
+                self.mous_loc_last = self.mous_loc
+                self.mous_loc = [int(x),int(y)]
+                dpg.set_value("_log_mouse_xy", f"({x:.1f}, {y:.1f})")
+
+        with dpg.group(horizontal=True, parent="_control_window"):
+            dpg.add_text(" : Mouse data : ")
+        # Add text in the control window to display mouse coordinates
+        with dpg.group(horizontal=True, parent="_control_window"):
+            dpg.add_text("Position : ")
+            dpg.add_text("N/A", tag="_log_mouse_xy")
+        with dpg.group(horizontal=True, parent="_control_window"):
+            dpg.add_text("Pixel Value : ")
+            dpg.add_text("N/A", tag="_log_mouse_value")
+            
+        def mouse_click_callback(sender, app_data):
+            # app_data: mouse button index (0=left, 1=right, 2=middle)
+            if dpg.is_item_hovered("_primary_window"):
+                x, y = self.mous_loc
+                button = app_data
+                self.on_image_click(button, x, y)
+
+        with dpg.handler_registry():
+            dpg.add_mouse_wheel_handler(callback=zoom_callback_fov)
+            dpg.add_mouse_drag_handler(callback=drag_callback)
+            dpg.add_mouse_move_handler(callback=mouse_hover_callback)
+            dpg.add_mouse_click_handler(callback=mouse_click_callback)
+            
+            
+        dpg.create_viewport(
+            title=f"{self.runname}",
+            width=self.W + 400,
+            height=self.H + (45 if os.name == "nt" else 0),
+            resizable=False,
+        )
+
+        ### global theme
+        with dpg.theme() as theme_no_padding:
+            with dpg.theme_component(dpg.mvAll):
+                # set all padding to 0 to avoid scroll bar
+                dpg.add_theme_style(
+                    dpg.mvStyleVar_WindowPadding, 0, 0, category=dpg.mvThemeCat_Core
+                )
+                dpg.add_theme_style(
+                    dpg.mvStyleVar_FramePadding, 0, 0, category=dpg.mvThemeCat_Core
+                )
+                dpg.add_theme_style(
+                    dpg.mvStyleVar_CellPadding, 0, 0, category=dpg.mvThemeCat_Core
+                )
+
+        dpg.bind_item_theme("_primary_window", theme_no_padding)
+
+        
+        
+            
+        dpg.setup_dearpygui()
+
+        dpg.show_viewport()
+        
+from scipy.ndimage import distance_transform_edt
+def get_viewmat(optimized_camera_to_world):
+    """
+    function that converts c2w to gsplat world2camera matrix, using compile for some speed
+    """
+    R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
+    T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
+    # flip the z and y axes to align with gsplat conventions
+    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
+    # analytic matrix inverse to get world2camera matrix
+    R_inv = R.transpose(1, 2)
+    T_inv = -torch.bmm(R_inv, T)
+    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
+    viewmat[:, 3, 3] = 1.0  # homogenous
+    viewmat[:, :3, :3] = R_inv
+    viewmat[:, :3, 3:4] = T_inv
+    return viewmat
+
+from scipy.ndimage import distance_transform_edt
+@torch.no_grad()
+def get_in_view_dyn_mask(camera, xyz, X, Y) -> torch.Tensor:
+    device = xyz.device
+    N = xyz.shape[0]
+
+    # Convert to homogeneous coordinates
+    xyz_h = torch.cat([xyz, torch.ones((N, 1), device=device)], dim=-1)  # (N, 4)
+
+    # World → Camera (OpenCV convention: +Z forward)
+    c2w = camera.pose
+    w2c = get_viewmat(c2w[None])[0]
+    xyz_cam = (xyz_h @ w2c.T)[:, :3]
+
+    # Only keep points in front of the camera
+    in_front = xyz_cam[:, 2] > 0
+
+    # Camera → Pixel (using intrinsics)
+    K = torch.from_numpy(camera.K).to(device=device, dtype=torch.float32)
+    xy = xyz_cam @ K.T  # (N, 3)
+    px = (xy[:, 0] / xy[:, 2]).long()
+    py = (xy[:, 1] / xy[:, 2]).long()
+
+    # Visibility check (inside image bounds)
+    in_bounds = (
+        (px >= 0) & (px < camera.image_width) &
+        (py >= 0) & (py < camera.image_height)
+    )
+    visible_mask = in_front & in_bounds
+
+    # Valid pixel indices
+    valid_idx = visible_mask.nonzero(as_tuple=True)[0]
+    if len(valid_idx) == 0:
+        print("No visible points found.")
+        return torch.zeros((camera.image_height, camera.image_width, 3), device=device)
+
+    px_valid = px[valid_idx]
+    py_valid = py[valid_idx]
+
+    # Scene occlusion mask (optional)
+    mask = (1. - camera.sceneoccluded_mask).to(device).squeeze(0)
+
+    sampled_mask = mask[py_valid, px_valid] > 0.5
+
+    # Projected XYZ image
+    H, W = camera.image_height, camera.image_width
+    xyz_img = torch.zeros((H, W, 3), device=device)
+
+    px_final = px_valid[sampled_mask]
+    py_final = py_valid[sampled_mask]
+    xyz_vals = xyz[valid_idx][sampled_mask]
+    xyz_img[py_final, px_final] = xyz_vals
+
+    # Visualization (optional)
+    show = False
+    if show:
+        import matplotlib.pyplot as plt
+        img_np = xyz_img.detach().cpu().numpy()
+
+        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+
+        ax[0].imshow(img_np)
+        ax[0].set_title("Projected XYZ (OpenCV)")
+        ax[0].axis("off")
+
+        ax[1].imshow(img_np)
+        ax[1].scatter(X, Y, s=3, c="red")
+        ax[1].set_title("With XY indexing")
+        ax[1].axis("off")
+
+        plt.show()
+        exit()
+        return None
+    
+    # --- Nearest-neighbor fill for empty pixels ---
+    xyz_np = xyz_img.cpu().numpy()   # [H, W, 3]
+    valid_mask = (xyz_np.sum(axis=-1) != 0)
+
+    # distance_transform_edt returns for each empty pixel the index of the nearest valid pixel
+    dist, indices = distance_transform_edt(~valid_mask,
+                                           return_indices=True)
+    filled = xyz_np[indices[0], indices[1]]  # nearest xyz per pixel
+
+    point = filled[Y, X, :]
+    
+    show = False
+    if show:
+        import matplotlib.pyplot as plt
+
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(111, projection="3d")
+
+        # Scatter all visible point cloud
+        ax.scatter(
+            xyz_vals[:, 0].cpu(),
+            xyz_vals[:, 1].cpu(),
+            xyz_vals[:, 2].cpu(),
+            s=1, c="blue", alpha=0.5, label="Point cloud"
+        )
+
+        # Scatter your selected points
+        ax.scatter(
+            point[ 0],
+            point[ 1],
+            point[ 2],
+            s=60, c="red", marker="o", label="Filtered XYZ"
+        )
+
+        ax.set_title("3D Point Cloud with Filtered Points")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.legend()
+
+        plt.show()
+        exit()
+
+    return torch.from_numpy(point).float().to(device)
+
+
+def remove_screen_points(camera, xyz):
+    device = xyz.device
+    N = xyz.shape[0]
+
+    # Convert to homogeneous coordinates
+    xyz_h = torch.cat([xyz, torch.ones((N, 1), device=device)], dim=-1)  # (N, 4)
+
+    # Apply full projection (world → clip space)
+    proj_xyz = xyz_h @ camera.full_proj_transform.to(device)  # (N, 4)
+
+    # Homogeneous divide to get NDC coordinates
+    ndc = proj_xyz[:, :3] / proj_xyz[:, 3:4]  # (N, 3)
+
+    in_front = proj_xyz[:, 2] > 0
+    in_ndc_bounds = (
+        (ndc[:, 0].abs() <= 1) &
+        (ndc[:, 1].abs() <= 1) &
+        (ndc[:, 2].abs() <= 1)
+    )
+    visible_mask = in_front & in_ndc_bounds
+
+    # Pixel coordinates for all points (will clamp to bounds)
+    px = (((ndc[:, 0] + 1) / 2) * camera.image_width).long().clamp(0, camera.image_width - 1)
+    py = (((ndc[:, 1] + 1) / 2) * camera.image_height).long().clamp(0, camera.image_height - 1)
+
+    # Scene mask (1 = free, 0 = masked/occluded)
+    mask_img = (camera.sceneoccluded_mask).to(device).squeeze(0)
+
+    # Start with all points marked False (not removed)
+    remove_mask = torch.zeros(N, dtype=torch.bool, device=device)
+
+    # Only check points that are visible
+    sampled_mask = mask_img[py[visible_mask], px[visible_mask]].bool()
+
+    # Mark visible points inside the mask for removal
+    remove_mask[visible_mask] = sampled_mask
+
+    return remove_mask
+    
+

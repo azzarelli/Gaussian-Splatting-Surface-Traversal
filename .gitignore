@@ -1,0 +1,11 @@
+output/*
+submodules1/*
+submodules/*
+*.pyc
+*/__pycache__/*
+__pycache__/
+*.pyc
+
+logs/*
+
+.vscode/
