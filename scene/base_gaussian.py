@@ -234,9 +234,9 @@ class BasicGaussianModel:
 
 class TraceGaussian(BasicGaussianModel):
 
-    def __init__(self,):
+    def __init__(self, color=[1., 0., 0.]):
         super().__init__()
-        self.base_color = [1., 0., 0.]
+        self.base_color = color
     
 
     def process_draw_loop(self, height, radius):
@@ -262,7 +262,9 @@ class TraceGaussian(BasicGaussianModel):
         
         # Red color
         colors = torch.zeros((N, 16, 3), device=device)
-        colors[:, 0] = 1.0  # R channel
+        colors[:, 0, 0] = self.base_color[0]  # R channel
+        colors[:, 0, 1] = self.base_color[1]  # G channel
+        colors[:, 0, 2] = self.base_color[2]  # B channel
         
         # Fixed scale
         scales = torch.full((N, 3), 0.01, device=device)

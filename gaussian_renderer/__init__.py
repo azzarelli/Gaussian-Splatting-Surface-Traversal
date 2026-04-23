@@ -82,7 +82,7 @@ def apply_colormap(render, threshold=0.0001):
     return rgb
 
 @torch.no_grad
-def render(viewpoint_camera, pc, obj_pc, trace_pc, scale_adjust, view_args=None):
+def render(viewpoint_camera, pc, editor, scale_adjust, view_args=None):
     """
     Render the scene for viewing
     """
@@ -126,7 +126,8 @@ def render(viewpoint_camera, pc, obj_pc, trace_pc, scale_adjust, view_args=None)
 
     
     # Overlay the object
-    if obj_pc.splats != None:
+    obj_pc = editor["pencil"]["pc"]
+    if obj_pc.splats != None and editor["pencil"]["view_flag"]:
         means, rotations, opacity, colors, scales = obj_pc.process_Gaussians(scale_adjust=scale_adjust)
         render_obj, alpha_obj, _ = rendering_pass(
             means, rotations, scales, opacity, colors,
@@ -139,19 +140,20 @@ def render(viewpoint_camera, pc, obj_pc, trace_pc, scale_adjust, view_args=None)
         
         render = render_obj*alpha_obj + (1.-alpha_obj)*render
 
-
-    means, rotations, opacity, colors, scales = trace_pc.process_draw_loop(view_args["loop_height"], view_args["loop_radius"])
-    render_obj, alpha_obj, _ = rendering_pass(
-        means, rotations, scales, opacity, colors,
-        viewpoint_camera, 
-        3,
-        mode='RGB'
-    )
-    render_obj = render_obj.squeeze(0).permute(2,0,1)
-    alpha_obj = alpha_obj.squeeze(0).permute(2,0,1)
-    
-    render = render_obj*alpha_obj + (1.-alpha_obj)*render
-    
+    if editor["loop"]["view_flag"]:
+        means, rotations, opacity, colors, scales = editor["loop"]["pc"].process_draw_loop(view_args["loop_height"], view_args["loop_radius"])
+        render_obj, alpha_obj, _ = rendering_pass(
+            means, rotations, scales, opacity, colors,
+            viewpoint_camera, 
+            3,
+            mode='RGB'
+        )
+        
+        render_obj = render_obj.squeeze(0).permute(2,0,1)
+        alpha_obj = alpha_obj.squeeze(0).permute(2,0,1)
+        
+        render = render_obj*alpha_obj + (1.-alpha_obj)*render
+        
     return render
 
 

@@ -1,0 +1,22 @@
+Loading project...
+  Loading ./logs/test...
+DPG loading ...
+Traceback (most recent call last):
+  File "gui.py", line 112, in <module>
+    gui.render()
+  File "/home/barry/Desktop/other_code/RigGS/gui_utils/base.py", line 142, in render
+    self.viewer_step()
+  File "/home/barry/anaconda3/envs/vsres/lib/python3.8/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/barry/Desktop/other_code/RigGS/gui_utils/base.py", line 163, in viewer_step
+    buffer_image = render(
+  File "/home/barry/anaconda3/envs/vsres/lib/python3.8/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/barry/Desktop/other_code/RigGS/gaussian_renderer/__init__.py", line 131, in render
+    means, rotations, opacity, colors, scales = obj_pc.process_Gaussians(scale_adjust=scale_adjust)
+  File "/home/barry/Desktop/other_code/RigGS/scene/draw_gaussians.py", line 17, in process_Gaussians
+    colors = self.get_features
+  File "/home/barry/Desktop/other_code/RigGS/scene/base_gaussian.py", line 89, in get_features
+    return torch.cat((features_dc, features_rest), dim=1)
+RuntimeError: Sizes of tensors must match except in dimension 1. Expected size 20 but got size 19 for tensor number 1 in the list.
+terminate called without an active exception

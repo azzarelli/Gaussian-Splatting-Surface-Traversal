@@ -112,6 +112,32 @@ class GaussianModel:
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self.get_rotation)
     
+    @torch.no_grad()
+    def compute_inverse_covariance(self):
+        """
+        Compute per-Gaussian inverse covariance Sigma^-1 = R * diag(1/s^2) * R^T.
+        Stores self.inv_covariance of shape (N, 3, 3).
+        Numerically stable: avoids explicitly forming and inverting Sigma.
+        """
+        w, x, y, z = self.get_rotation.unbind(-1)
+        scale = self.get_scaling  # (N, 3), already exp-activated
+
+        # Build rotation matrix from quaternion (same convention as get_covmat)
+        xx, yy, zz = x*x, y*y, z*z
+        xy, xz, yz = x*y, x*z, y*z
+        wx, wy, wz = w*x, w*y, w*z
+
+        R = torch.stack([
+            torch.stack([1 - 2*(yy+zz), 2*(xy - wz),   2*(xz + wy)], dim=-1),
+            torch.stack([2*(xy + wz),   1 - 2*(xx+zz), 2*(yz - wx)], dim=-1),
+            torch.stack([2*(xz - wy),   2*(yz + wx),   1 - 2*(xx+yy)], dim=-1),
+        ], dim=-2)  # (N, 3, 3)
+
+        # Sigma^-1 = R * diag(1/s^2) * R^T
+        inv_s2 = 1.0 / (scale * scale)                 # (N, 3)
+        R_scaled = R * inv_s2.unsqueeze(1)             # broadcast over rows: (N,3,3)
+        self.inv_covariance = R_scaled @ R.transpose(1, 2)  # (N, 3, 3)
+        
     @property
     def get_covmat(self):
         w, x, y, z = self.get_rotation.unbind(-1)
@@ -230,6 +256,17 @@ class GaussianModel:
             "shN":torch.from_numpy(features_extra).cuda().permute(0,2,1).float()
         }
         
+        self.compute_inverse_covariance()
+    
+    def mahalanobis(self, points):
+        """
+        points: (N, 3) query points, one per Gaussian (or broadcastable).
+        Returns squared Mahalanobis distance (N,).
+        """
+        d = points - self.get_xyz                              # (N, 3)
+        # d^T Sigma^-1 d per Gaussian
+        return torch.einsum('ni,nij,nj->n', d, self.inv_covariance, d)
+
 from scipy.spatial import KDTree
 import torch
 

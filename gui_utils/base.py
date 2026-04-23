@@ -44,8 +44,17 @@ class GUIBase:
         self.gui = True
         self.scene = scene
         self.gaussians = scene.gaussians
-        self.drawgaussians = DrawGaussians()
-        self.tracegaussians = TraceGaussian()
+        
+        self.editor={
+            "pencil":{
+                "view_flag": False,
+                "pc":DrawGaussians()
+            },
+            "loop":{
+                "view_flag": False,
+                "pc":TraceGaussian([0., 1., 0.])
+            }
+        }
         
         self.runname = name
         
@@ -154,8 +163,7 @@ class GUIBase:
         buffer_image = render(
                 cam,
                 self.gaussians,
-                self.drawgaussians,
-                self.tracegaussians,
+                self.editor,
                 self.scale_adjust,
                 view_args={
                     "vis_mode":self.vis_mode,
@@ -226,7 +234,7 @@ class GUIBase:
             if mean.sum().abs() > 0.0001:
                 scale = scale
                 mean = mean
-                self.drawgaussians.add_gaussian(mean, scale, quat, self.gaussians)
+                self.editor["pencil"]["pc"].add_gaussian(mean, scale, quat, self.gaussians)
 
     
     def register_dpg(self):
@@ -288,7 +296,23 @@ class GUIBase:
             #  Control Functions
             # ----------------
             with dpg.collapsing_header(label="Viewer Config", default_open=True):
+                
+                def callback_toggle_show_pencil(sender):
+                    self.editor["pencil"]["view_flag"] = ~self.editor["pencil"]["view_flag"]
+                def callback_toggle_show_loop(sender):
+                    self.editor["loop"]["view_flag"] = ~self.editor["loop"]["view_flag"]
+                    
+                def callback_toggle_show_off_editor(sender):
+                    for key in self.editor.keys(): self.editor[key]["view_flag"] = False
+                    
+                    
+                dpg.add_text(" : Editor : ")
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Off", callback=callback_toggle_show_off_editor)
+                    dpg.add_button(label="Penicl", callback=callback_toggle_show_pencil)
+                    dpg.add_button(label="Loop", callback=callback_toggle_show_loop)
                      
+                    
                 def callback_toggle_reset_cam(sender):
                     # TODO: reset camera position
                     pass
@@ -323,7 +347,7 @@ class GUIBase:
                         self.design_state = 'viewing'
                         
                 def callback_toggle_reset_draw_point(sender, app_data):
-                    self.drawgaussians.reset()
+                    self.editor["pencil"]["pc"].reset()
                     
                 with dpg.group(horizontal=True):
                     dpg.add_button(label="Add", callback=callback_toggle_add_point)
@@ -361,7 +385,7 @@ class GUIBase:
                     tag="_slider_lr_adjust",
                     default_value=self.loop_radius,
                     min_value=0.0,
-                    max_value=3.,
+                    max_value=4.,
                     callback=callback_lr_adjust,
                 )
                 
@@ -435,7 +459,7 @@ class GUIBase:
             
         def mouse_click_callback(sender, app_data):
             # app_data: mouse button index (0=left, 1=right, 2=middle)
-            if dpg.is_item_hovered("_primary_window"):
+            if dpg.is_item_hovered("_primary_window") and self.editor["pencil"]["view_flag"]:
                 x, y = self.mous_loc
                 button = app_data
                 self.on_image_click(button, x, y)

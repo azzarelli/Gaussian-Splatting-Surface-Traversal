@@ -50,7 +50,7 @@ class ObjectModel(BasicGaussianModel):
             
             
             num_samples = 10
-            for j in range(1, num_samples-1):
+            for j in range(1, num_samples):
                 
                 dir = B - A
                 t = (j)/num_samples
@@ -147,27 +147,13 @@ def sample_gaussian_density(gaussians, point, sample_indices):
     xyz = gaussians.get_xyz[sample_indices]
     opacities = gaussians.get_opacity.squeeze(-1)[sample_indices]
     scales = gaussians.get_scaling[sample_indices]      # (M, 3)
-    rots = gaussians.get_rotation[sample_indices]       # (M, 4)
+    inv_cov = gaussians.inv_covariance[sample_indices]     # (M, 4)
 
     if xyz.shape[0] == 0:
         return torch.tensor(0.0, device=point.device)
 
-    # Rotate diff into local Gaussian frame using quaternion transpose (no inversion needed)
-    w, x, y, z = rots.unbind(-1)
-    xx, yy, zz = x*x, y*y, z*z
-    xy, xz, yz = x*y, x*z, y*z
-    wx, wy, wz = w*x, w*y, w*z
-
-    R = torch.stack([
-        torch.stack([1-2*(yy+zz), 2*(xy-wz),   2*(xz+wy)], dim=-1),
-        torch.stack([2*(xy+wz),   1-2*(xx+zz), 2*(yz-wx)], dim=-1),
-        torch.stack([2*(xz-wy),   2*(yz+wx),   1-2*(xx+yy)], dim=-1),
-    ], dim=-2)  # (M, 3, 3)
-
-    diff = (point.unsqueeze(0) - xyz).unsqueeze(-1)                    # (M, 3, 1)
-    diff_local = torch.bmm(R.transpose(1, 2), diff).squeeze(-1)        # (M, 3)
-    mahal = ((diff_local / scales) ** 2).sum(dim=-1)                   # (M,)
-
+    diff = point.unsqueeze(0) - xyz                                    # (M, 3)
+    mahal = torch.einsum('ni,nij,nj->n', diff, inv_cov, diff)          # (M,)
     return (opacities * torch.exp(-0.5 * mahal)).sum()
 
 def find_surface_intersection(gaussians, ray_origin, ray_dir, sample_indices=None,
