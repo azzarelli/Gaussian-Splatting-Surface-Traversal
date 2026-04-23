@@ -15,6 +15,7 @@ import time
 from scene.cameras import Camera
 from gaussian_renderer import render, render_draw_mouse_click
 from scene.draw_gaussians import ObjectModel as DrawGaussians
+from scene.base_gaussian import TraceGaussian
 
 to_tensor = transforms.ToTensor()  # auto converts HWC uint8 → CHW float32 in [0,1]
 
@@ -44,6 +45,8 @@ class GUIBase:
         self.scene = scene
         self.gaussians = scene.gaussians
         self.drawgaussians = DrawGaussians()
+        self.tracegaussians = TraceGaussian()
+        
         self.runname = name
         
         # Set the width and height of the expected image
@@ -66,6 +69,9 @@ class GUIBase:
         
         self.design_state = 'add_points' #'viewing'
         self.scale_adjust = 0.07
+        
+        self.loop_height=1.
+        self.loop_radius=1.
 
         # Viewer settings for camera/view selection
         self.save_frame=False
@@ -149,8 +155,13 @@ class GUIBase:
                 cam,
                 self.gaussians,
                 self.drawgaussians,
+                self.tracegaussians,
+                self.scale_adjust,
                 view_args={
                     "vis_mode":self.vis_mode,
+                    "loop_height":self.loop_height,
+                    "loop_radius":self.loop_radius
+                        
                 },
         )
 
@@ -214,7 +225,7 @@ class GUIBase:
             )
             if mean.sum().abs() > 0.0001:
                 scale = scale
-                mean = mean # + 0.003*(torch.from_numpy((self.camera.T)).cuda().float() - mean)
+                mean = mean
                 self.drawgaussians.add_gaussian(mean, scale, quat, self.gaussians)
 
     
@@ -331,40 +342,66 @@ class GUIBase:
                     callback=callback_scale_adjust,
                 )
                 
+                def callback_lh_adjust(sender, app_data):
+                    self.loop_height = float(app_data)
+                dpg.add_text(": Loop Height : ")
+                dpg.add_slider_float(
+                    label="lh adjust",
+                    tag="_slider_lh_adjust",
+                    default_value=self.loop_height,
+                    min_value=self.gaussians.get_xyz[:,2].min().item(),
+                    max_value=self.gaussians.get_xyz[:,2].max().item(),
+                    callback=callback_lh_adjust,
+                )
+                def callback_lr_adjust(sender, app_data):
+                    self.loop_radius = float(app_data)
+                dpg.add_text(": Loop Radius : ")
+                dpg.add_slider_float(
+                    label="lr adjust",
+                    tag="_slider_lr_adjust",
+                    default_value=self.loop_radius,
+                    min_value=0.0,
+                    max_value=3.,
+                    callback=callback_lr_adjust,
+                )
+                
         def drag_callback(sender, app_data):
-            if self.drag_im_buffer is not None:
-                mouse_hover_value = self.drag_im_buffer[:3, self.mous_loc[1], self.mous_loc[0]].sum()
-            else:
-                mouse_hover_value = 0.0
+            
+            if dpg.is_item_hovered("_primary_window"):
 
-            view_drag_thresh = 0.5
-            if mouse_hover_value < view_drag_thresh:
-                button, rel_x, rel_y = app_data
-                cam = self.camera
+                if self.drag_im_buffer is not None:
+                    mouse_hover_value = self.drag_im_buffer[:3, self.mous_loc[1], self.mous_loc[0]].sum()
+                else:
+                    mouse_hover_value = 0.0
 
-                yaw_speed   = 0.001
-                pitch_speed = 0.001
-                cam.yaw   -= rel_x * yaw_speed
-                cam.pitch += rel_y * pitch_speed
-                cam.pitch  = np.clip(cam.pitch, -np.pi/2 + 0.01, np.pi/2 - 0.01)  # never hit poles
+                view_drag_thresh = 0.5
+                if mouse_hover_value < view_drag_thresh:
+                    button, rel_x, rel_y = app_data
+                    cam = self.camera
 
-                # Camera position on sphere around world origin (Z-up)
-                cam.T = np.array([
-                    cam.orbit_radius * np.sin(cam.yaw) * np.cos(cam.pitch),
-                    cam.orbit_radius * np.cos(cam.yaw) * np.cos(cam.pitch),
-                    cam.orbit_radius * np.sin(cam.pitch),
-                ], dtype=np.float32)
+                    yaw_speed   = 0.001
+                    pitch_speed = 0.001
+                    cam.yaw   -= rel_x * yaw_speed
+                    cam.pitch += rel_y * pitch_speed
+                    cam.pitch  = np.clip(cam.pitch, -np.pi/2 + 0.01, np.pi/2 - 0.01)  # never hit poles
 
-                # Look-at with fixed Z-up — no roll ever
-                forward = -cam.T / np.linalg.norm(cam.T)
-                world_up = np.array([0, 0, -1], dtype=np.float32)
-                right = np.cross(forward, world_up)
-                right /= np.linalg.norm(right)
-                up = np.cross(right, forward)
-                up /= np.linalg.norm(up)
+                    # Camera position on sphere around world origin (Z-up)
+                    cam.T = np.array([
+                        cam.orbit_radius * np.sin(cam.yaw) * np.cos(cam.pitch),
+                        cam.orbit_radius * np.cos(cam.yaw) * np.cos(cam.pitch),
+                        cam.orbit_radius * np.sin(cam.pitch),
+                    ], dtype=np.float32)
 
-                cam.R = np.stack([right, up, forward], axis=1).astype(np.float32)      
-        
+                    # Look-at with fixed Z-up — no roll ever
+                    forward = -cam.T / np.linalg.norm(cam.T)
+                    world_up = np.array([0, 0, -1], dtype=np.float32)
+                    right = np.cross(forward, world_up)
+                    right /= np.linalg.norm(right)
+                    up = np.cross(right, forward)
+                    up /= np.linalg.norm(up)
+
+                    cam.R = np.stack([right, up, forward], axis=1).astype(np.float32)      
+            
         
         def zoom_callback_fov(sender, app_data):
             delta = app_data  # scroll: +1 = up (zoom in), -1 = down (zoom out)

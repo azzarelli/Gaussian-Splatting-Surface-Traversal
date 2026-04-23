@@ -2,19 +2,24 @@ import torch
 
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.base_gaussian import BasicGaussianModel
+
+
+
 class ObjectModel(BasicGaussianModel):
 
     def __init__(self,):
         super().__init__()
+        
+        self.base_color = [1., 1., 1.]
 
-    def process_Gaussians(self):
+    def process_Gaussians(self, scale_adjust=None):
         means3D = self.splats['means']
         colors = self.get_features
         
         opacity = self.splats['opacities']
 
-        scales = self.splats['scales'] 
-        
+        scales = self.splats['scales'] if scale_adjust == None else self.splats["scales"] * 0. + scale_adjust 
+
         rotations = self.splats["quats"]
         
         return means3D, rotations, opacity, colors, scales
@@ -34,7 +39,7 @@ class ObjectModel(BasicGaussianModel):
         self.splats["scales"] = torch.cat([self.splats["scales"], scale.unsqueeze(0)], dim=0)
         self.splats["quats"] = torch.cat([self.splats["quats"], quat.unsqueeze(0)], dim=0)
         self.splats["opacities"] = torch.cat([self.splats["opacities"], torch.tensor([[1.]]).float().cuda()], dim=0)
-        self.splats["sh0"] = torch.cat([self.splats["sh0"], torch.tensor([[[1., 1., 1.]]]).float().cuda()], dim=0)
+        self.splats["sh0"] = torch.cat([self.splats["sh0"], torch.tensor([[self.base_color]]).float().cuda()], dim=0)
         self.splats["shN"] = torch.cat([self.splats["shN"], torch.zeros((1, 15, 3)).float().cuda()], dim=0)
         
         
@@ -103,11 +108,9 @@ class ObjectModel(BasicGaussianModel):
                 self.splats["scales"] = torch.cat([self.splats["scales"], scale.unsqueeze(0)], dim=0)
                 self.splats["quats"] = torch.cat([self.splats["quats"], quat.unsqueeze(0)], dim=0)
                 self.splats["opacities"] = torch.cat([self.splats["opacities"], torch.tensor([[1.]]).float().cuda()], dim=0)
-                self.splats["sh0"] = torch.cat([self.splats["sh0"], torch.tensor([[[0., 1., 0.]]]).float().cuda()], dim=0)
+                self.splats["sh0"] = torch.cat([self.splats["sh0"], torch.tensor([[self.base_color]]).float().cuda()], dim=0)
                 self.splats["shN"] = torch.cat([self.splats["shN"], torch.zeros((1, 15, 3)).float().cuda()], dim=0)
-                
-                A = mid
-            
+                            
     
     def reset(self):
         self.splats = {

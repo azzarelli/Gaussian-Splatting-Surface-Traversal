@@ -11,7 +11,6 @@ from plyfile import PlyData, PlyElement
 
 
 class BasicGaussianModel:
-
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
@@ -233,5 +232,39 @@ class BasicGaussianModel:
         return self.splats["means"].shape[0]
     
 
+class TraceGaussian(BasicGaussianModel):
 
+    def __init__(self,):
+        super().__init__()
+        self.base_color = [1., 0., 0.]
     
+
+    def process_draw_loop(self, height, radius):
+        
+        N = 100
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Evenly spaced angles around the circle: [0, 2π)
+        angles = torch.linspace(0, 2 * np.pi, N + 1, device=device)[:-1]
+        
+        # Positions on the circle at given height
+        x = radius * torch.cos(angles)
+        y = radius * torch.sin(angles)
+        z = torch.full((N,), float(height), device=device)
+        means3D = torch.stack([x, y, z], dim=-1)  # (N, 3)
+        
+        # Identity rotation quaternion (w, x, y, z) = (1, 0, 0, 0)
+        rotations = torch.zeros((N, 4), device=device)
+        rotations[:, 0] = 1.0
+        
+        # Opacity = 1
+        opacity = torch.ones((N, 1), device=device)
+        
+        # Red color
+        colors = torch.zeros((N, 16, 3), device=device)
+        colors[:, 0] = 1.0  # R channel
+        
+        # Fixed scale
+        scales = torch.full((N, 3), 0.01, device=device)
+        
+        return means3D, rotations, opacity, colors, scales
