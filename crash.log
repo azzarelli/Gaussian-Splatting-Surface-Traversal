@@ -1,0 +1,22 @@
+Loading project...
+  Loading ./logs/test...
+DPG loading ...
+Traceback (most recent call last):
+  File "gui.py", line 112, in <module>
+    gui.render()
+  File "/home/barry/Desktop/other_code/RigGS/gui_utils/base.py", line 143, in render
+    self.viewer_step()
+  File "/home/barry/anaconda3/envs/vsres/lib/python3.8/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/barry/Desktop/other_code/RigGS/gui_utils/base.py", line 177, in viewer_step
+    buffer_image = render(
+  File "/home/barry/anaconda3/envs/vsres/lib/python3.8/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/barry/Desktop/other_code/RigGS/gaussian_renderer/__init__.py", line 114, in render
+    render, alpha, _ = rendering_pass(
+  File "/home/barry/Desktop/other_code/RigGS/gaussian_renderer/__init__.py", line 43, in rendering_pass
+    colors, alphas, meta = rasterization(
+  File "/home/barry/anaconda3/envs/vsres/lib/python3.8/site-packages/gsplat/rendering.py", line 285, in rasterization
+    assert opacities.shape == batch_dims + (N,), opacities.shape
+AssertionError: torch.Size([21469])
+terminate called without an active exception

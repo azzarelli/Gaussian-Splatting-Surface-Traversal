@@ -232,9 +232,7 @@ class GaussianModel:
     def point_count(self):
         return self.splats["means"].shape[0]
     
-
     def add_gaussian(self,mean, scale, quat, gaussians, debug=False):
-        
         if self.splats == None:
             self.splats = {
                 "means":torch.empty((0, 3)).cuda().float(),
@@ -263,7 +261,6 @@ class GaussianModel:
             for j in range(1, num_samples-1):
                 
                 dir = B - A
-
                 t = (j)/num_samples
                 
                 mid = A + t * dir
@@ -309,7 +306,7 @@ class GaussianModel:
                     return
 
                 min_dist, min_idx = min(valid, key=lambda x: x[0])
-                intersection_point = ray_o[min_idx] + (min_dist*1.2) * ray_d[min_idx]
+                intersection_point = ray_o[min_idx] + (min_dist*1.5) * ray_d[min_idx]
                 
                 if debug:
                     selected_splat_idx = -(16 - min_idx)
@@ -322,7 +319,7 @@ class GaussianModel:
                 self.splats["sh0"] = torch.cat([self.splats["sh0"], torch.tensor([[[0., 1., 0.]]]).float().cuda()], dim=0)
                 self.splats["shN"] = torch.cat([self.splats["shN"], torch.zeros((1, 15, 3)).float().cuda()], dim=0)
                 
-                # B = mid
+                A = mid
             
     
     def reset(self):
