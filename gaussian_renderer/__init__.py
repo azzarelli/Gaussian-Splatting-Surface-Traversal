@@ -82,82 +82,64 @@ def apply_colormap(render, threshold=0.0001):
     return rgb
 
 @torch.no_grad
-def render(viewpoint_camera, means3D, rotation, opacity, colors, scales, view_args=None):
+def render(viewpoint_camera, pc, obj_pc, view_args=None):
     """
     Render the scene for viewing
     """
-    extras = None
     
+    # Main Gaussian Model    
     active_sh = 3
+    means, rotations, opacity, colors, scales = process_Gaussians(pc)
+
+
     # Set arguments depending on type of viewing
     if view_args['vis_mode'] in 'render':
         mode = "RGB"
-    elif view_args['vis_mode'] == 'alpha':
-        mode = "RGB"
-    elif view_args['vis_mode'] == 'normals':
-        mode = "normals"
-    elif view_args['vis_mode'] == '2D':
-        mode = "2D"
     elif view_args['vis_mode'] == 'D':
         mode = "D"
-    elif view_args['vis_mode'] == 'ED':
-        mode = "ED"
     elif view_args['vis_mode'] == 'xyz':
-        colors = means3D.unsqueeze(0)
+        colors = means.unsqueeze(0)
         active_sh=None
         mode = "RGB"
-
     else:
         mode = "RGB"
 
     # Render
     render, alpha, _ = rendering_pass(
-        means3D, rotation, scales, opacity, colors,
+        means, rotations, scales, opacity, colors,
         viewpoint_camera, 
         active_sh,
         mode=mode
     )
     
-    if view_args['vis_mode'] == 'normals' or view_args['vis_mode'] == '2D':
-        view_args['vis_mode'] = 'render'
-    
+
     # Process image
     if view_args['vis_mode'] == 'render':
         render = render.squeeze(0).permute(2,0,1)
 
-    elif view_args['vis_mode'] == 'alpha':
-        render = alpha
-        render = (render - render.min())/ (render.max() - render.min())
-        render = render.squeeze(0).permute(2,0,1).repeat(3,1,1)
-        
     elif view_args['vis_mode'] == 'D':
         render = (render - render.min())/ (render.max() - render.min())
         render = render.squeeze(0).permute(2,0,1).repeat(3,1,1)
-        
-    elif view_args['vis_mode'] == 'ED':
-        render = (render - render.min())/ (render.max() - render.min())
-        render = render.squeeze(0).permute(2,0,1).repeat(3,1,1)
-        
-    elif view_args['vis_mode'] == 'invariance':
-        render = render.squeeze(0).permute(2,0,1).repeat(3,1,1)
-    elif view_args['vis_mode'] == 'uv':
-        render = render.squeeze(0).permute(2,0,1)
-        render = torch.cat([render, render[0].unsqueeze(0)*0.], dim=0)
-    elif view_args['vis_mode'] == 'sigma':
-        render = apply_colormap(render.squeeze(0))  # (3, H, W)
-
-    elif view_args['vis_mode'] in 'deform':
-        render = render.squeeze(0).permute(2,0,1)
-
     
     elif view_args['vis_mode'] == 'xyz':
         render = render.squeeze(0).permute(2,0,1)
 
+    
+    # Overlay the object
+    if obj_pc.splats != None:
+        means, rotations, opacity, colors, scales = obj_pc.process_Gaussians()
+        render_obj, alpha_obj, _ = rendering_pass(
+            means, rotations, scales, opacity, colors,
+            viewpoint_camera, 
+            3,
+            mode='RGB'
+        )
+        render_obj = render_obj.squeeze(0).permute(2,0,1)
+        alpha_obj = alpha_obj.squeeze(0).permute(2,0,1)
+        
+        render = render_obj*alpha_obj + (1.-alpha_obj)*render
 
-    return {
-        "render": render,
-        "extras":extras # A dict containing mor point info
-        }
+    return render
 
 
 import torch.nn.functional as F

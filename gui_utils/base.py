@@ -1,16 +1,9 @@
-try:
-    import dearpygui.dearpygui as dpg
-except:
-    print("No dpg running")
-    dpg = None
-from scene.cameras import Camera
-
+import dearpygui.dearpygui as dpg
 import numpy as np
 import os
 import copy
 import psutil
 import torch
-from gaussian_renderer import render, render_draw_mouse_click
 from tqdm import tqdm
 import time
 import json
@@ -19,7 +12,9 @@ from torchvision import transforms
 import threading
 import time
 
-from scene.draw_gaussians import GaussianModel as DrawGaussians
+from scene.cameras import Camera
+from gaussian_renderer import render, render_draw_mouse_click
+from scene.draw_gaussians import ObjectModel as DrawGaussians
 
 to_tensor = transforms.ToTensor()  # auto converts HWC uint8 → CHW float32 in [0,1]
 
@@ -35,17 +30,6 @@ def process_Gaussians(pc):
     
     return means3D, rotations, opacity, colors, scales
 
-def process_draw_Gaussians(pc):
-    means3D = pc.splats['means']
-    colors = pc.get_features
-    
-    opacity = pc.splats['opacities']
-
-    scales = pc.splats['scales'] #pc.get_scaling_with_3D_filter
-    
-    rotations = pc.splats["quats"]
-    
-    return means3D, rotations, opacity, colors, scales
 
 
 class GUIBase:
@@ -160,33 +144,16 @@ class GUIBase:
 
         cam = self.camera # Need to define CAMERA
         
-        if self.drawgaussians.splats != None:
-            means, rotations, opacity, colors, scales = process_Gaussians(self.gaussians)
-            means_draw, rotations_draw, opacity_draw, colors_draw, scales_draw = process_draw_Gaussians(self.drawgaussians)
-            
-            scales_draw = scales_draw*0. + self.scale_adjust
-            means = torch.cat([means, means_draw], dim=0)
-            rotations = torch.cat([rotations, rotations_draw], dim=0)
-            opacity = torch.cat([opacity, opacity_draw], dim=0)
-            colors = torch.cat([colors, colors_draw], dim=0)
-            scales = torch.cat([scales, scales_draw], dim=0)
-        else:
-            means, rotations, opacity, colors, scales = process_Gaussians(self.gaussians)
-
             
         buffer_image = render(
                 cam,
-                means, rotations, opacity, colors, scales,
+                self.gaussians,
+                self.drawgaussians,
                 view_args={
                     "vis_mode":self.vis_mode,
                 },
         )
 
-        try:
-            buffer_image = buffer_image["render"]
-        except:
-            print(f'Mode "{self.vis_mode}" does not work')
-            buffer_image = buffer_image['render']
         
 
         # Display value of image at current mouse position
@@ -326,10 +293,6 @@ class GUIBase:
                     self.vis_mode = 'render'
                 def callback_toggle_show_depth(sender):
                     self.vis_mode = 'D'
-                def callback_toggle_show_edepth(sender):
-                    self.vis_mode = 'ED'
-                def callback_toggle_show_2dgsdepth(sender):
-                    self.vis_mode = '2D' 
                 def callback_toggle_show_XYZ(sender):
                     self.vis_mode = 'xyz'
 
@@ -337,8 +300,6 @@ class GUIBase:
                 with dpg.group(horizontal=True):
                     dpg.add_button(label="RGB", callback=callback_toggle_show_rgb)
                     dpg.add_button(label="Zc", callback=callback_toggle_show_depth)
-                    dpg.add_button(label="E[Zc]", callback=callback_toggle_show_edepth)
-                    dpg.add_button(label="Zc", callback=callback_toggle_show_2dgsdepth)
                     dpg.add_button(label="XYZ", callback=callback_toggle_show_XYZ)
 
             with dpg.collapsing_header(label="Drawing Config", default_open=True):
