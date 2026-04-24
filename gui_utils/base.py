@@ -225,7 +225,7 @@ class GUIBase:
         x, y: pixel coordinates in the image
         """
         
-        if self.design_state == 'add_points':      
+        if self.design_state == 'add_points':
             mean, scale, quat = render_draw_mouse_click(
                     self.camera ,
                     self.gaussians,
@@ -235,6 +235,7 @@ class GUIBase:
                 scale = scale
                 mean = mean
                 self.editor["pencil"]["pc"].add_gaussian(mean, scale, quat, self.gaussians)
+    
 
     
     def register_dpg(self):
@@ -464,13 +465,18 @@ class GUIBase:
                 button = app_data
                 self.on_image_click(button, x, y)
 
+        def key_press_callback(sender, app_data):
+            # app_data is the key code
+            if app_data == dpg.mvKey_Return and self.editor["loop"]["view_flag"]:
+                self.editor["loop"]["pc"].set_loop(self.gaussians)
+                
         with dpg.handler_registry():
             dpg.add_mouse_wheel_handler(callback=zoom_callback_fov)
             dpg.add_mouse_drag_handler(callback=drag_callback)
             dpg.add_mouse_move_handler(callback=mouse_hover_callback)
             dpg.add_mouse_click_handler(callback=mouse_click_callback)
-            
-            
+            dpg.add_key_press_handler(callback=key_press_callback)            
+        
         dpg.create_viewport(
             title=f"{self.runname}",
             width=self.W + 400,

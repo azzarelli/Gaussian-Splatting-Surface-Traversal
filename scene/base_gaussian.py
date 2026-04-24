@@ -242,9 +242,12 @@ class TraceGaussian(BasicGaussianModel):
         self.radius = None
         self.N = None
         
-        self.rays = None 
+        self.rays = None
+        
+        self.record = None
+        self.mesh_data = []
 
-    def generate_loop(self, height, radius, N):
+    def generate_loop(self, height, radius, N, raw_return=False):
         # Evenly spaced angles around the circle: [0, 2π)
         angles = torch.linspace(0, 2 * np.pi, N + 1, device="cuda")[:-1]
         
@@ -256,6 +259,10 @@ class TraceGaussian(BasicGaussianModel):
         
         direction = -means / radius
         direction[:, -1] = 0
+        
+        
+        if raw_return:
+            return means,direction
         
         self.rays={
             "means":means,
@@ -299,26 +306,51 @@ class TraceGaussian(BasicGaussianModel):
         # Compute the of the samples with intersection with the pc
         means_int, rotations_int, opacity_int, colors_int, scales_int = self.process_ray_intersection(pc)
         
-        means = torch.cat([means, means_int], dim=0)
-        rotations = torch.cat([rotations, rotations_int], dim=0)
-        opacity = torch.cat([opacity, opacity_int], dim=0)
-        colors = torch.cat([colors, colors_int], dim=0)
-        scales = torch.cat([scales, scales_int], dim=0)
+        # Temporarily save for later
+        self.record = (means_int, rotations_int, opacity_int, colors_int, scales_int)
+        
+        mean_cat = [means, means_int]
+        rot_cat = [rotations, rotations_int]
+        opac_cat = [opacity, opacity_int]
+        col_cat = [colors, colors_int]
+        sca_cat = [scales, scales_int]
+
+        if self.mesh_data != []:
+            for meta in self.mesh_data:
+                if meta["type"] == "user" or meta["type"] == "inbetweens":
+                    obj = meta["record"]
+                    mean_cat.append(obj[0]) 
+                    rot_cat.append(obj[1]) 
+                    opac_cat.append(obj[2]) 
+                    col_cat.append(obj[3]) 
+                    sca_cat.append(obj[4]) 
+            
+        
+        means = torch.cat(mean_cat, dim=0)
+        rotations = torch.cat(rot_cat, dim=0)
+        opacity = torch.cat(opac_cat, dim=0)
+        colors = torch.cat(col_cat, dim=0)
+        scales = torch.cat(sca_cat, dim=0)
 
         return means, rotations, opacity, colors, scales
 
 
-    def process_ray_intersection(self, pc):
+    def process_ray_intersection(self, pc, ray_origins=None, ray_direction=None, height=None):
+        if height is None:
+            height=self.height
+        if ray_origins is None and ray_direction is None:
+            ray_origins = self.rays["means"]
+            ray_direction = self.rays["directions"]
+            
         # Initial curll based on expected point height
         pc_means = pc.get_xyz
         diff = (pc_means[:, -1].max() - pc_means[:, -1].min())*0.1
-        inbounds = (pc_means[:, -1] - self.height).abs() < diff 
+        inbounds = (pc_means[:, -1] - height).abs() < diff 
         
         means = pc_means[inbounds]
         inv_cov = pc.inv_covariance[inbounds]
         
-        ray_origins = self.rays["means"]
-        ray_direction = self.rays["directions"]
+        
         N = ray_origins.shape[0]
         M = means.shape[0]
         
@@ -376,7 +408,47 @@ class TraceGaussian(BasicGaussianModel):
         rotations_int[:, 0] = 1.0
         opacity_int = torch.ones((N_hit, 1), device="cuda")
         colors_int = torch.zeros((N_hit, 16, 3), device="cuda")
-        colors_int[:, 0, 0] = 1.0  # Highlight intersections in red
+        colors_int[:, 0, 1] = 1.0  # Highlight intersections in red
         scales_int = torch.full((N_hit, 3), 0.01, device="cuda")
 
         return int_points, rotations_int, opacity_int, colors_int, scales_int
+    
+    
+    def set_loop(self, pc):
+        content={
+            "type":"user",
+            "height": self.height,
+            "radius":self.radius,
+            "N":self.N,
+            "record":self.record
+        }
+        self.mesh_data.append(content)
+        
+        targets = []
+        for meta in self.mesh_data:
+            if meta["type"] == "user": 
+                targets.append(meta)
+                
+        if len(targets) >= 2:
+            # subsample N heights between the last two
+            A = targets[-2]
+            B = targets[-1]
+            
+            sample_heights = B["height"] - A["height"]
+            sample_heights = [A["height"] + sample_heights*(i/10) for i in range(1, 10)]
+            sample_radius = [A["radius"]*(i/10) +B["radius"]*((10-i)/10) for i in range(1, 10)]
+            
+            for sh, sr in zip(sample_heights, sample_radius):
+                ray_o, ray_d = self.generate_loop(sh, sr, A["N"], raw_return=True)
+                means_int, rotations_int, opacity_int, colors_int, scales_int = self.process_ray_intersection(pc, ray_origins=ray_o, ray_direction=ray_d, height=sh)
+                
+                colors_int = colors_int*0
+                colors_int[:, 0, 0] = 1.
+                content={
+                    "type":"inbetweens",
+                    "height":sh,
+                    "radius":sr,
+                    "N":A["N"],
+                    "record":(means_int, rotations_int, opacity_int, colors_int, scales_int)
+                }
+                self.mesh_data.append(content)
