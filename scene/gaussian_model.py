@@ -266,6 +266,8 @@ class GaussianModel:
         d = points - self.get_xyz                              # (N, 3)
         # d^T Sigma^-1 d per Gaussian
         return torch.einsum('ni,nij,nj->n', d, self.inv_covariance, d)
+    
+    
 
 from scipy.spatial import KDTree
 import torch

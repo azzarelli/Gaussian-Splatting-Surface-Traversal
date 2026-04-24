@@ -141,7 +141,7 @@ def render(viewpoint_camera, pc, editor, scale_adjust, view_args=None):
         render = render_obj*alpha_obj + (1.-alpha_obj)*render
 
     if editor["loop"]["view_flag"]:
-        means, rotations, opacity, colors, scales = editor["loop"]["pc"].process_draw_loop(view_args["loop_height"], view_args["loop_radius"])
+        means, rotations, opacity, colors, scales = editor["loop"]["pc"].process_loop(pc, view_args["loop_height"], view_args["loop_radius"])
         render_obj, alpha_obj, _ = rendering_pass(
             means, rotations, scales, opacity, colors,
             viewpoint_camera, 

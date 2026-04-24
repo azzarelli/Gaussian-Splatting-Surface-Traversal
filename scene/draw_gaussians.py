@@ -67,38 +67,24 @@ class ObjectModel(BasicGaussianModel):
                 sample_indices = (sample_indices < max_dist)
                 
                 # Construct the radial plane basis around AB @ mid
-                ray_o, ray_d = generate_perpendiculat_rays(mid, dir)
-                
-                intersections = []
-                for i in range(16):
-                    dist = find_surface_intersection(
-                        gaussians,
-                        ray_origin=ray_o[i],
-                        ray_dir=ray_d[i],
-                        sample_indices=sample_indices,
-                        max_dist=max_dist,
-                        num_steps=200,
-                        threshold=0.5,
-                    )
-                    intersections.append(dist)
-                            
-                    if debug:
-                        debug_point = ray_o[i] + max_dist * ray_d[i]
-                        self.splats["means"] = torch.cat([self.splats["means"], debug_point.unsqueeze(0)], dim=0)
-                        self.splats["scales"] = torch.cat([self.splats["scales"], scale.unsqueeze(0)], dim=0)
-                        self.splats["quats"] = torch.cat([self.splats["quats"], quat.unsqueeze(0)], dim=0)
-                        self.splats["opacities"] = torch.cat([self.splats["opacities"], torch.tensor([[1.]]).float().cuda()], dim=0)
-                        self.splats["sh0"] = torch.cat([self.splats["sh0"], torch.tensor([[[1., 1., 0.]]]).float().cuda()], dim=0)  # green
-                        self.splats["shN"] = torch.cat([self.splats["shN"], torch.zeros((1, 15, 3)).float().cuda()], dim=0)
+                ray_o, ray_d = generate_perpendicular_rays(mid, dir)
 
+                hit_dists = find_surface_intersections_batched(
+                    gaussians, ray_o, ray_d,
+                    sample_indices=sample_indices,
+                    max_dist=max_dist,
+                    num_steps=200,
+                    threshold=0.5,
+                )
 
-                valid = [(d, i) for i, d in enumerate(intersections) if d is not None]
-                if not valid:
+                finite = torch.isfinite(hit_dists)
+                if not finite.any():
                     print("No intersections found! Try lowering threshold or increasing max_dist")
                     return
 
-                min_dist, min_idx = min(valid, key=lambda x: x[0])
-                intersection_point = ray_o[min_idx] + (min_dist*1.5) * ray_d[min_idx]
+                min_idx = torch.where(finite, hit_dists, torch.full_like(hit_dists, float('inf'))).argmin()
+                min_dist = hit_dists[min_idx]
+                intersection_point = ray_o[min_idx] + (min_dist * 1.5) * ray_d[min_idx]
                 
                 if debug:
                     selected_splat_idx = -(16 - min_idx)
@@ -194,3 +180,87 @@ def distCUDA2(points):
     meanDists = (dists[:, 1:] ** 2).mean(1)
 
     return torch.tensor(meanDists, dtype=points.dtype, device=points.device)
+
+
+
+def generate_perpendicular_rays(mid, dir, num_rays=16):
+    # pick an arbitrary axis not parallel to dir
+    arbitrary = torch.tensor([1.0, 0.0, 0.0], device=dir.device)
+    if torch.abs(torch.dot(dir, arbitrary)) > 0.99:
+        arbitrary = torch.tensor([0.0, 1.0, 0.0], device=dir.device)
+
+    u = torch.cross(dir, arbitrary, dim=-1); u = u / torch.norm(u)
+    v = torch.cross(dir, u, dim=-1);         v = v / torch.norm(v)
+
+    angles = torch.linspace(0, 2 * torch.pi, num_rays + 1, device=dir.device)[:-1]
+    ray_dirs = torch.cos(angles)[:, None] * u + torch.sin(angles)[:, None] * v  # (R, 3)
+    ray_origins = mid.unsqueeze(0).expand(num_rays, -1).contiguous()           # (R, 3)
+    return ray_origins, ray_dirs
+
+
+def sample_density_batch(xyz_sel, opac_sel, inv_cov_sel, points):
+    """
+    Evaluate density at many points against a pre-selected subset of Gaussians.
+    xyz_sel:    (M, 3)
+    opac_sel:   (M,)
+    inv_cov_sel:(M, 3, 3)
+    points:     (..., 3)   arbitrary leading shape
+    returns:    (...,)     density per point
+    """
+    lead_shape = points.shape[:-1]
+    P = points.reshape(-1, 3)                        # (P, 3)
+    diff = P[:, None, :] - xyz_sel[None, :, :]       # (P, M, 3)
+    # (P,M,3) x (M,3,3) x (P,M,3)  -> (P,M)
+    mahal = torch.einsum('pmi,mij,pmj->pm', diff, inv_cov_sel, diff)
+    contrib = opac_sel[None, :] * torch.exp(-0.5 * mahal)  # (P, M)
+    return contrib.sum(dim=-1).reshape(lead_shape)
+
+def find_surface_intersections_batched(gaussians, ray_origins, ray_dirs,
+                                       sample_indices, max_dist=5.0,
+                                       num_steps=200, threshold=0.5,
+                                       refine_iters=8, step_chunk=16):
+    device = ray_origins.device
+    R = ray_origins.shape[0]
+
+    xyz_sel     = gaussians.get_xyz[sample_indices]
+    opac_sel    = gaussians.get_opacity.squeeze(-1)[sample_indices]
+    inv_cov_sel = gaussians.inv_covariance[sample_indices]
+
+    if xyz_sel.shape[0] == 0:
+        return torch.full((R,), float('inf'), device=device)
+
+    ts = torch.linspace(0.0, max_dist, num_steps, device=device)
+
+    # March in chunks; stop early once every ray has hit
+    first_idx = torch.full((R,), -1, dtype=torch.long, device=device)
+    for start in range(0, num_steps, step_chunk):
+        end = min(start + step_chunk, num_steps)
+        ts_chunk = ts[start:end]                                   # (Sc,)
+        pts = ray_origins[None] + ts_chunk[:, None, None] * ray_dirs[None]  # (Sc, R, 3)
+        dens = sample_density_batch(xyz_sel, opac_sel, inv_cov_sel, pts)    # (Sc, R)
+        below = dens < threshold                                   # (Sc, R)
+
+        # For rays that haven't hit yet, find first hit in this chunk
+        not_hit_yet = first_idx < 0
+        chunk_any = below.any(dim=0) & not_hit_yet
+        if chunk_any.any():
+            chunk_first = below.float().argmax(dim=0) + start      # global index
+            first_idx = torch.where(chunk_any, chunk_first, first_idx)
+
+        if (first_idx >= 0).all():
+            break
+
+    any_hit = first_idx >= 0
+    safe_idx = first_idx.clamp(min=0)
+    hi = ts[safe_idx]
+    lo = ts[(safe_idx - 1).clamp(min=0)]
+
+    for _ in range(refine_iters):
+        mid_t = 0.5 * (lo + hi)
+        mid_pts = ray_origins + mid_t[:, None] * ray_dirs
+        d = sample_density_batch(xyz_sel, opac_sel, inv_cov_sel, mid_pts)
+        miss = d < threshold
+        hi = torch.where(miss, mid_t, hi)
+        lo = torch.where(miss, lo, mid_t)
+
+    return torch.where(any_hit, hi, torch.full_like(hi, float('inf')))

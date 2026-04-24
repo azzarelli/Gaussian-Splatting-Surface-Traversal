@@ -237,36 +237,146 @@ class TraceGaussian(BasicGaussianModel):
     def __init__(self, color=[1., 0., 0.]):
         super().__init__()
         self.base_color = color
-    
+        
+        self.height = None
+        self.radius = None
+        self.N = None
+        
+        self.rays = None 
 
-    def process_draw_loop(self, height, radius):
-        
-        N = 100
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        
+    def generate_loop(self, height, radius, N):
         # Evenly spaced angles around the circle: [0, 2π)
-        angles = torch.linspace(0, 2 * np.pi, N + 1, device=device)[:-1]
+        angles = torch.linspace(0, 2 * np.pi, N + 1, device="cuda")[:-1]
         
         # Positions on the circle at given height
         x = radius * torch.cos(angles)
         y = radius * torch.sin(angles)
-        z = torch.full((N,), float(height), device=device)
-        means3D = torch.stack([x, y, z], dim=-1)  # (N, 3)
+        z = torch.full((N,), float(height), device="cuda")
+        means = torch.stack([x, y, z], dim=-1)  # (N, 3)
         
-        # Identity rotation quaternion (w, x, y, z) = (1, 0, 0, 0)
-        rotations = torch.zeros((N, 4), device=device)
+        direction = -means / radius
+        direction[:, -1] = 0
+        
+        self.rays={
+            "means":means,
+            "directions":direction
+        }
+        
+    def process_draw_ray_samples(self):        
+        # Get globals
+        N = self.N
+                
+        # Arbitrary quaternion 
+        rotations = torch.zeros((N, 4), device="cuda")
         rotations[:, 0] = 1.0
         
-        # Opacity = 1
-        opacity = torch.ones((N, 1), device=device)
+        # Fixed dense opacity
+        opacity = torch.ones((N, 1), device="cuda")
         
-        # Red color
-        colors = torch.zeros((N, 16, 3), device=device)
+        # Arbitrary color for readability
+        colors = torch.zeros((N, 16, 3), device="cuda")
         colors[:, 0, 0] = self.base_color[0]  # R channel
         colors[:, 0, 1] = self.base_color[1]  # G channel
         colors[:, 0, 2] = self.base_color[2]  # B channel
         
-        # Fixed scale
-        scales = torch.full((N, 3), 0.01, device=device)
+        # Arbitrary scale (placeholder that is rescaled based on GUI Viewing/Editor settings)
+        scales = torch.full((N, 3), 0.01, device="cuda")
         
-        return means3D, rotations, opacity, colors, scales
+        return self.rays["means"], rotations, opacity, colors, scales
+    
+    def process_loop(self, pc, height, radius, N = 100):        
+        # Set globals
+        self.height = height
+        self.radius = radius
+        self.N = N
+        
+        # Compute self.rays["means"] and self.rays["directions"]
+        self.generate_loop(height, radius, N)
+        
+        # Get the visual points of the ray origins
+        means, rotations, opacity, colors, scales = self.process_draw_ray_samples()
+
+        # Compute the of the samples with intersection with the pc
+        means_int, rotations_int, opacity_int, colors_int, scales_int = self.process_ray_intersection(pc)
+        
+        means = torch.cat([means, means_int], dim=0)
+        rotations = torch.cat([rotations, rotations_int], dim=0)
+        opacity = torch.cat([opacity, opacity_int], dim=0)
+        colors = torch.cat([colors, colors_int], dim=0)
+        scales = torch.cat([scales, scales_int], dim=0)
+
+        return means, rotations, opacity, colors, scales
+
+
+    def process_ray_intersection(self, pc):
+        # Initial curll based on expected point height
+        pc_means = pc.get_xyz
+        diff = (pc_means[:, -1].max() - pc_means[:, -1].min())*0.1
+        inbounds = (pc_means[:, -1] - self.height).abs() < diff 
+        
+        means = pc_means[inbounds]
+        inv_cov = pc.inv_covariance[inbounds]
+        
+        ray_origins = self.rays["means"]
+        ray_direction = self.rays["directions"]
+        N = ray_origins.shape[0]
+        M = means.shape[0]
+        
+        o = ray_origins.unsqueeze(1)    # (N, 1, 3)
+        d = ray_direction.unsqueeze(1)       # (N, 1, 3)
+        mu = means.unsqueeze(0)  # (1, M, 3)
+        delta = o - mu                  # (N, M, 3)
+
+        d_exp = d.expand(N, M, 3)          # (N, M, 3) — use this everywhere
+        
+        # --- Compute quadratic coefficients A, B, C ---
+        # A = d^T Σ⁻¹ d  →  (N, M)
+        # Using einsum: for each (n,m), contract d[n] with inv_cov[m] with d[n]
+        inv_cov = inv_cov.unsqueeze(0)  # (1, M, 3, 3)
+
+        # Σ⁻¹ d → (N, M, 3)
+        inv_cov_d     = torch.einsum('nmij,nmj->nmi', inv_cov.expand(N, -1, -1, -1), d_exp)
+        inv_cov_delta = torch.einsum('nmij,nmj->nmi', inv_cov.expand(N, -1, -1, -1), delta)
+        A = (d_exp * inv_cov_d).sum(-1)
+        B = 2 * (delta * inv_cov_d).sum(-1)
+        C = (delta * inv_cov_delta).sum(-1)
+
+        # --- Analytic peak: t* = -B / 2A ---
+        t_star = -B / (2 * A + 1e-8)                        # (N, M)
+
+        # Only consider hits in front of the ray origin
+        valid = t_star > 0                                   # (N, M)
+
+        # --- Mahalanobis distance at peak ---
+        d2_min = C - (B ** 2) / (4 * A + 1e-8)             # (N, M)
+
+        # Gaussian weight at peak
+        weight = torch.exp(-0.5 * d2_min)                   # (N, M)
+
+        # Threshold: only keep strong hits
+        WEIGHT_THRESH = 0.2
+        hits = valid & (weight > WEIGHT_THRESH)              # (N, M)
+
+        # --- Per ray: find the closest (smallest t*) hit ---
+        t_star_masked = t_star.clone()
+        t_star_masked[~hits] = float('inf')
+        best_t, best_m = t_star_masked.min(dim=1)           # (N,), (N,)
+
+        hit_rays = best_t < float('inf')                    # (N,) — rays that hit anything
+
+        # --- Compute intersection points ---
+        # p* = o + t* d
+        int_points = ray_origins + best_t.unsqueeze(1) * ray_direction   # (N, 3)
+
+        # --- Build outputs only for hit rays ---
+        int_points = int_points[hit_rays]                   # (N', 3)
+        N_hit = int_points.shape[0]
+
+        rotations_int = torch.zeros((N_hit, 4), device="cuda")
+        rotations_int[:, 0] = 1.0
+        opacity_int = torch.ones((N_hit, 1), device="cuda")
+        colors_int = torch.zeros((N_hit, 16, 3), device="cuda")
+        colors_int[:, 0, 0] = 1.0  # Highlight intersections in red
+        scales_int = torch.full((N_hit, 3), 0.01, device="cuda")
+
+        return int_points, rotations_int, opacity_int, colors_int, scales_int
