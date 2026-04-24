@@ -452,3 +452,196 @@ class TraceGaussian(BasicGaussianModel):
                     "record":(means_int, rotations_int, opacity_int, colors_int, scales_int)
                 }
                 self.mesh_data.append(content)
+                
+            self.export_blender_obj(
+                "./settled.obj",
+                blender_exe="blender",          # or full path e.g. "/usr/bin/blender"
+                drop_height=0.5,
+                sim_frames=250,
+            )
+                
+    def export_blender_obj(
+        self,
+        out_path,
+        blender_exe="blender",
+        drop_height=0.5,
+        sim_frames=250,
+        workdir=None,
+    ):
+        """
+        Simulate the cut cylindrical mesh dropping onto a ground plane using
+        Blender's cloth sim, and export the settled mesh as an OBJ to out_path.
+        """
+        import subprocess, tempfile
+
+        # --- Gather mesh grid ---
+        loops = [m for m in self.mesh_data if m["type"] in ("user", "inbetweens")]
+        if len(loops) < 2:
+            print("Need at least 2 loops.")
+            return
+        loops = sorted(loops, key=lambda m: m["height"])
+        N = loops[0]["N"]; H = len(loops)
+        P = np.stack(
+            [lp["record"][0].detach().cpu().numpy() for lp in loops], axis=0
+        ).astype(np.float64)
+        P[..., :2] -= P[..., :2].reshape(-1, 2).mean(axis=0)
+        P[..., 2] -= P[..., 2].min()
+        P[..., 2] += drop_height
+
+        # --- Workdir and input OBJ ---
+        workdir = workdir or tempfile.mkdtemp(prefix="cloth_export_")
+        os.makedirs(workdir, exist_ok=True)
+        in_obj = os.path.join(workdir, "mesh_in.obj")
+        script = os.path.join(workdir, "run.py")
+
+        out_path = os.path.abspath(out_path)
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+        with open(in_obj, "w") as f:
+            for i in range(H):
+                for k in range(N):
+                    x, y, z = P[i, k]
+                    f.write(f"v {x} {y} {z}\n")
+            def vid(i, k): return i * N + k + 1
+            for i in range(H - 1):
+                for k in range(N - 1):
+                    f.write(f"f {vid(i,k)} {vid(i,k+1)} {vid(i+1,k+1)} {vid(i+1,k)}\n")
+
+        # --- Blender script. IMPORTANT: every line inside the f-string must
+        # start at column 0 so we don't write indented Python to disk. ---
+        blender_script = f'''\
+import bpy, sys, os, traceback
+
+IN_OBJ     = r"{in_obj}"
+OUT_OBJ    = r"{out_path}"
+SIM_FRAMES = {sim_frames}
+
+try:
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    scene = bpy.context.scene
+    scene.frame_start = 1
+    scene.frame_end   = SIM_FRAMES
+
+    # Ground
+    bpy.ops.mesh.primitive_plane_add(size=20, location=(0, 0, 0))
+    ground = bpy.context.active_object
+    bpy.ops.object.modifier_add(type='COLLISION')
+    for attr, val in [("damping", 0.5), ("friction_factor", 0.8),
+                      ("thickness_outer", 0.01), ("thickness_inner", 0.01)]:
+        if hasattr(ground.collision, attr):
+            setattr(ground.collision, attr, val)
+
+    # Import cloth
+    if hasattr(bpy.ops.wm, "obj_import"):
+        bpy.ops.wm.obj_import(filepath=IN_OBJ)
+    else:
+        bpy.ops.import_scene.obj(filepath=IN_OBJ)
+    cloth = bpy.context.selected_objects[0]
+    cloth.name = "Cloth"
+    bpy.context.view_layer.objects.active = cloth
+    bpy.ops.object.shade_smooth()
+    bpy.ops.object.modifier_add(type='CLOTH')
+    cs = cloth.modifiers["Cloth"].settings
+    col = cloth.modifiers["Cloth"].collision_settings
+    cs.mass = 0.5
+    cs.tension_stiffness = cs.compression_stiffness = cs.shear_stiffness = 40.0
+    cs.bending_stiffness = 2.0
+    cs.tension_damping = cs.compression_damping = cs.shear_damping = 5.0
+    cs.bending_damping = 2.0
+    cs.air_damping = 1.5
+    col.use_collision = True
+    col.use_self_collision = True
+    col.self_distance_min = 0.002
+    col.distance_min = 0.003
+    col.collision_quality = 4
+
+    # Drive the sim
+    print("Simulating", SIM_FRAMES, "frames...")
+    for frm in range(scene.frame_start, scene.frame_end + 1):
+        scene.frame_set(frm)
+        if frm % 25 == 0:
+            print("  frame", frm)
+
+    # Capture simulated mesh at final frame and bake it into the object
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = cloth.evaluated_get(depsgraph)
+    mesh_eval = bpy.data.meshes.new_from_object(eval_obj)
+    cloth.modifiers.clear()
+    cloth.data = mesh_eval
+
+    # Select just the cloth for export
+    bpy.ops.object.select_all(action='DESELECT')
+    cloth.select_set(True)
+    bpy.context.view_layer.objects.active = cloth
+
+    # --- Try Blender's OBJ exporters, then fall back to a manual writer ---
+    exported = False
+
+    if hasattr(bpy.ops.wm, "obj_export"):
+        try:
+            res = bpy.ops.wm.obj_export(
+                filepath=OUT_OBJ,
+                export_selected_objects=True,
+                export_materials=False,
+                apply_modifiers=True,
+            )
+            print("bpy.ops.wm.obj_export ->", res)
+            exported = os.path.exists(OUT_OBJ)
+        except Exception as e:
+            print("bpy.ops.wm.obj_export raised:", e)
+
+    if not exported and hasattr(bpy.ops, "export_scene") and hasattr(bpy.ops.export_scene, "obj"):
+        try:
+            res = bpy.ops.export_scene.obj(
+                filepath=OUT_OBJ,
+                use_selection=True,
+                use_materials=False,
+            )
+            print("bpy.ops.export_scene.obj ->", res)
+            exported = os.path.exists(OUT_OBJ)
+        except Exception as e:
+            print("bpy.ops.export_scene.obj raised:", e)
+
+    if not exported:
+        # Manual writer — no dependency on Blender's IO addons
+        print("Falling back to manual OBJ writer")
+        mesh = cloth.data
+        world = cloth.matrix_world
+        with open(OUT_OBJ, "w") as f:
+            f.write("# manual export from Blender cloth sim\\n")
+            for v in mesh.vertices:
+                co = world @ v.co
+                f.write("v %.6f %.6f %.6f\\n" % (co.x, co.y, co.z))
+            for poly in mesh.polygons:
+                idx = " ".join(str(i + 1) for i in poly.vertices)
+                f.write("f " + idx + "\\n")
+        exported = os.path.exists(OUT_OBJ)
+
+    if not exported:
+        print("ERROR: failed to write", OUT_OBJ)
+        sys.exit(1)
+
+    print("Wrote", OUT_OBJ)
+
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+'''
+
+        with open(script, "w") as fh:
+            fh.write(blender_script)
+
+        cmd = [blender_exe, "--background", "--python", script]
+        print("Running:", " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        print("===== Blender stdout =====")
+        print(result.stdout)
+        print("===== Blender stderr =====")
+        print(result.stderr)
+        if result.returncode != 0:
+            raise RuntimeError(f"Blender exited with code {result.returncode}")
+        if not os.path.exists(out_path):
+            raise RuntimeError(f"Blender ran but did not produce {out_path}")
+
+        print(f"Exported settled mesh to {out_path}")
+        return out_path
