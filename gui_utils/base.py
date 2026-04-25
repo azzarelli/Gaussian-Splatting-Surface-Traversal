@@ -59,19 +59,25 @@ class GUIBase:
         self.runname = name
         
         # ---- Layout dimensions ----
-        # Main render canvas: 720p (1280x720)
-        self.W, self.H = 1280, 720
-        # Secondary render canvas: 512x512
-        self.W2, self.H2 = 512, 512
+        # Main render canvas: reduced width (980x720)
+        self.W, self.H = 980, 720
+        # Toolbar height beneath the main canvas (this one is draggable)
+        self.TOOLBAR_H = 60
+        # Total window height
+        self.TOTAL_H = self.H + self.TOOLBAR_H
+        # Two secondary render canvases stacked vertically, each 512 x (TOTAL_H/2)
+        self.W2 = 512
+        self.H2 = self.TOTAL_H // 2  # each secondary canvas height
         # Control panel width
         self.CTRL_W = 400
-        # Toolbar height beneath each canvas
-        self.TOOLBAR_H = 60
+        # Width of the shared right-hand toolbar for the two secondary canvases
+        self.RIGHT_TOOLBAR_W = 80
         
         # Initialize the image buffers
         # NOTE: dpg.add_raw_texture expects (H, W, C) layout
         self.buffer_image = np.ones((self.H, self.W, 3), dtype=np.float32)
         self.buffer_image_2 = np.ones((self.H2, self.W2, 3), dtype=np.float32)
+        self.buffer_image_3 = np.ones((self.H2, self.W2, 3), dtype=np.float32)
         
         # Other important visualization parameters
         self.vis_mode = 'render'
@@ -94,6 +100,15 @@ class GUIBase:
         # Viewer settings for camera/view selection
         self.save_frame=False
 
+        # Derive intrinsics from a fixed vertical FOV so they stay correct
+        # if the canvas resolution changes. ~32.36° matches the original
+        # 1080p calibration (fy=1866.66, cy=540).
+        _vfov_deg = 32.36
+        _fy = 0.5 * self.H / np.tan(0.5 * np.deg2rad(_vfov_deg))
+        _fx = _fy  # square pixels
+        _cx = self.W / 2
+        _cy = self.H / 2
+
         self.camera = Camera(
             R=[[
                     -2.821299744937278e-07,
@@ -111,8 +126,8 @@ class GUIBase:
                     -0.9659259915351868,
                 ]], 
             T=[[0.,0.,0.]],
-            fx=1244.44, fy=1244.44,
-            cx=640.,   cy=360.,
+            fx=_fx, fy=_fy,
+            cx=_cx, cy=_cy,
             
             width=self.W, height=self.H,
 
@@ -222,9 +237,10 @@ class GUIBase:
             "_texture", buffer_image
         )  # buffer must be contiguous, else seg fault!
         
-        # Update secondary texture (currently just shows the placeholder buffer;
-        # replace this when you wire up a real second source)
+        # Update secondary textures (currently just placeholder buffers;
+        # replace these when you wire up real second/third sources)
         dpg.set_value("_texture_2", self.buffer_image_2)
+        dpg.set_value("_texture_3", self.buffer_image_3)
         
         dpg.set_value("_log_mouse_value", f"({[f'{v:.4f}' for v in mous_hover_value]})")
 
@@ -265,7 +281,7 @@ class GUIBase:
                 format=dpg.mvFormat_Float_rgb,
                 tag="_texture",
             )
-            # Secondary 512x512 texture
+            # Top secondary texture (512 x H/2)
             dpg.add_raw_texture(
                 self.W2,
                 self.H2,
@@ -273,16 +289,25 @@ class GUIBase:
                 format=dpg.mvFormat_Float_rgb,
                 tag="_texture_2",
             )
+            # Bottom secondary texture (512 x H/2)
+            dpg.add_raw_texture(
+                self.W2,
+                self.H2,
+                self.buffer_image_3,
+                format=dpg.mvFormat_Float_rgb,
+                tag="_texture_3",
+            )
 
         # ---- Layout positions ----
         # Main canvas at (0, 0), size W x H
-        # Main toolbar below it at (0, H), size W x TOOLBAR_H
-        # Control window to the right of main canvas at (W, 0), size CTRL_W x H
-        # Secondary canvas to the right of control at (W + CTRL_W, 0), size W2 x H2
-        # Secondary toolbar below it at (W + CTRL_W, H2), size W2 x TOOLBAR_H
+        # Main toolbar below it at (0, H), size W x TOOLBAR_H  [DRAGGABLE]
+        # Control window to the right of main canvas at (W, 0), size CTRL_W x (H + TOOLBAR_H)
+        # Top secondary canvas at (W + CTRL_W, 0), size W2 x H2 (where H2 = H/2)
+        # Bottom secondary canvas at (W + CTRL_W, H2), size W2 x H2
+        # Shared right-hand toolbar at (W + CTRL_W + W2, 0), size RIGHT_TOOLBAR_W x H
 
-        TOTAL_W = self.W + self.CTRL_W + self.W2
-        TOTAL_H = max(self.H + self.TOOLBAR_H, self.H2 + self.TOOLBAR_H)
+        TOTAL_W = self.W + self.CTRL_W + self.W2 + self.RIGHT_TOOLBAR_W
+        TOTAL_H = self.TOTAL_H
 
         ### register window
         # the main rendered image, as the primary window
@@ -294,6 +319,7 @@ class GUIBase:
             no_move=True,
             no_title_bar=True,
             no_scrollbar=True,
+            no_resize=True,
         ):
             # add the texture
             dpg.add_image("_texture")
@@ -307,14 +333,15 @@ class GUIBase:
                 dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 5)
                 dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 3, 3)
 
-        # ---- Toolbar beneath the main canvas ----
+        # ---- Toolbar beneath the main canvas (DRAGGABLE) ----
+        # This window has no `no_move=True` and shows a title bar so the user
+        # can grab it and drag it around. It can also be collapsed.
         with dpg.window(
+            label="Main Toolbar",
             tag="_main_toolbar_window",
             width=self.W,
             height=self.TOOLBAR_H,
             pos=[0, self.H],
-            no_move=True,
-            no_title_bar=True,
             no_scrollbar=True,
             no_resize=True,
         ):
@@ -347,6 +374,7 @@ class GUIBase:
             pos=[self.W, 0],
             no_move=True,
             no_title_bar=True,
+            no_resize=True,
         ):
             # timer stuff
             with dpg.group(horizontal=True):
@@ -467,7 +495,7 @@ class GUIBase:
                 dpg.add_text("Pixel Value : ")
                 dpg.add_text("N/A", tag="_log_mouse_value")
 
-        # ---- Secondary render canvas (right of control window) ----
+        # ---- Top secondary render canvas (right of control window) ----
         with dpg.window(
             tag="_secondary_window",
             width=self.W2,
@@ -476,15 +504,29 @@ class GUIBase:
             no_move=True,
             no_title_bar=True,
             no_scrollbar=True,
+            no_resize=True,
         ):
             dpg.add_image("_texture_2")
 
-        # ---- Toolbar beneath the secondary canvas ----
+        # ---- Bottom secondary render canvas ----
+        with dpg.window(
+            tag="_secondary_window_2",
+            width=self.W2,
+            height=self.H2,
+            pos=[self.W + self.CTRL_W, self.H2],
+            no_move=True,
+            no_title_bar=True,
+            no_scrollbar=True,
+            no_resize=True,
+        ):
+            dpg.add_image("_texture_3")
+
+        # ---- Shared right-hand toolbar (vertical, spans both secondary canvases) ----
         with dpg.window(
             tag="_secondary_toolbar_window",
-            width=self.W2,
-            height=self.TOOLBAR_H,
-            pos=[self.W + self.CTRL_W, self.H2],
+            width=self.RIGHT_TOOLBAR_W,
+            height=self.TOTAL_H,
+            pos=[self.W + self.CTRL_W + self.W2, 0],
             no_move=True,
             no_title_bar=True,
             no_scrollbar=True,
@@ -499,13 +541,16 @@ class GUIBase:
             def callback_sec_tool_c(sender):
                 # TODO: implement
                 pass
+            def callback_sec_tool_d(sender):
+                # TODO: implement
+                pass
 
-            with dpg.group(horizontal=True):
-                dpg.add_text(" Aux : ")
-                dpg.add_button(label="Load", callback=callback_sec_tool_a)
-                dpg.add_button(label="Clear", callback=callback_sec_tool_b)
-                dpg.add_button(label="Save", callback=callback_sec_tool_c)
-
+            # Stacked vertically so they sit nicely in the narrow right column
+            dpg.add_text(" Aux ")
+            dpg.add_button(label="Load",  callback=callback_sec_tool_a, width=self.RIGHT_TOOLBAR_W - 16)
+            dpg.add_button(label="Clear", callback=callback_sec_tool_b, width=self.RIGHT_TOOLBAR_W - 16)
+            dpg.add_button(label="Save",  callback=callback_sec_tool_c, width=self.RIGHT_TOOLBAR_W - 16)
+            dpg.add_button(label="Swap",  callback=callback_sec_tool_d, width=self.RIGHT_TOOLBAR_W - 16)
         # ---- Mouse / keyboard handlers (unchanged behavior, only main canvas) ----
         def drag_callback(sender, app_data):
             
@@ -609,6 +654,7 @@ class GUIBase:
 
         dpg.bind_item_theme("_primary_window", theme_no_padding)
         dpg.bind_item_theme("_secondary_window", theme_no_padding)
+        dpg.bind_item_theme("_secondary_window_2", theme_no_padding)
 
         dpg.setup_dearpygui()
 
