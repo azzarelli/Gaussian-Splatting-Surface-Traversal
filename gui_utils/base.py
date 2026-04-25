@@ -159,12 +159,13 @@ class GUIBase:
 
         cam = self.camera # Need to define CAMERA
         
-            
+        
         buffer_image = render(
                 cam,
                 self.gaussians,
                 self.editor,
                 self.scale_adjust,
+                
                 view_args={
                     "vis_mode":self.vis_mode,
                     "loop_height":self.loop_height,
@@ -218,6 +219,8 @@ class GUIBase:
         if 1./(t1-t0) < 500:
             dpg.set_value("_log_infer_time", f"{1./(t1-t0)} ")
 
+        
+        
     def on_image_click(self, button: int, x: int, y: int):
         """Override in subclass to handle clicks on the rendered image.
 

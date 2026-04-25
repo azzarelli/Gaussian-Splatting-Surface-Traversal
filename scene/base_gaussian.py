@@ -8,7 +8,7 @@ from plyfile import PlyData, PlyElement
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
 from plyfile import PlyData, PlyElement
-
+import math
 
 class BasicGaussianModel:
     def setup_functions(self):
@@ -232,6 +232,44 @@ class BasicGaussianModel:
         return self.splats["means"].shape[0]
     
 
+import taichi as ti
+ti.init(arch=ti.cuda)
+
+# Max anticipated grid size — adjust as needed
+MAX_H, MAX_W = 20, 500
+
+_pos   = ti.Vector.field(3, dtype=ti.f32, shape=(MAX_H, MAX_W))
+_vel   = ti.Vector.field(3, dtype=ti.f32, shape=(MAX_H, MAX_W))
+_force = ti.Vector.field(3, dtype=ti.f32, shape=(MAX_H, MAX_W))
+_sim_H = ti.field(dtype=ti.i32, shape=())
+_sim_W = ti.field(dtype=ti.i32, shape=())
+
+@ti.kernel
+def _cloth_step(stiffness: ti.f32, damping: ti.f32, dt: ti.f32, rest: ti.f32):
+    H = _sim_H[None]
+    W = _sim_W[None]
+    for i, j in _pos:
+        if i < H and j < W:
+            _force[i, j] = ti.Vector([0.0, 0.0, -9.8])
+
+    for i, j in _pos:
+        if i < H and j < W:
+            for di, dj in ti.static([(1,0),(-1,0),(0,1),(0,-1)]):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < H and 0 <= nj < W:
+                    delta = _pos[ni, nj] - _pos[i, j]
+                    dist  = delta.norm()
+                    f     = stiffness * (dist - rest) * delta.normalized()
+                    _force[i, j] += f
+
+    for i, j in _pos:
+        if i < H and j < W:
+            _vel[i, j] = (_vel[i, j] + dt * _force[i, j]) * damping
+            _pos[i, j] += dt * _vel[i, j]
+            if _pos[i, j].z < 0:
+                _pos[i, j].z = 0.0
+                _vel[i, j].z = 0.0
+
 class TraceGaussian(BasicGaussianModel):
 
     def __init__(self, color=[1., 0., 0.]):
@@ -452,196 +490,68 @@ class TraceGaussian(BasicGaussianModel):
                     "record":(means_int, rotations_int, opacity_int, colors_int, scales_int)
                 }
                 self.mesh_data.append(content)
-                
-            self.export_blender_obj(
-                "./settled.obj",
-                blender_exe="blender",          # or full path e.g. "/usr/bin/blender"
-                drop_height=0.5,
-                sim_frames=250,
-            )
-                
-    def export_blender_obj(
-        self,
-        out_path,
-        blender_exe="blender",
-        drop_height=0.5,
-        sim_frames=250,
-        workdir=None,
-    ):
-        """
-        Simulate the cut cylindrical mesh dropping onto a ground plane using
-        Blender's cloth sim, and export the settled mesh as an OBJ to out_path.
-        """
-        import subprocess, tempfile
+            
+            
+            
+            
 
-        # --- Gather mesh grid ---
-        loops = [m for m in self.mesh_data if m["type"] in ("user", "inbetweens")]
-        if len(loops) < 2:
-            print("Need at least 2 loops.")
-            return
-        loops = sorted(loops, key=lambda m: m["height"])
-        N = loops[0]["N"]; H = len(loops)
-        P = np.stack(
-            [lp["record"][0].detach().cpu().numpy() for lp in loops], axis=0
-        ).astype(np.float64)
-        P[..., :2] -= P[..., :2].reshape(-1, 2).mean(axis=0)
-        P[..., 2] -= P[..., 2].min()
-        P[..., 2] += drop_height
+            rings = [A["record"][0]]
+            for meta in self.mesh_data:
+                if meta["type"] == "inbetweens":
+                    rings.append(meta["record"][0])
+            rings.append(B["record"][0])
 
-        # --- Workdir and input OBJ ---
-        workdir = workdir or tempfile.mkdtemp(prefix="cloth_export_")
-        os.makedirs(workdir, exist_ok=True)
-        in_obj = os.path.join(workdir, "mesh_in.obj")
-        script = os.path.join(workdir, "run.py")
+            W = min(r.shape[0] for r in rings)
+            mesh_tensor = torch.stack([r[:W] for r in rings], dim=0).float()  # (H, W, 3)
 
-        out_path = os.path.abspath(out_path)
-        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            # ✅ Don't run sim here — store as pending for main thread
+            self.pending_sim = {
+                "mesh_tensor": mesh_tensor,
+                "target_idx": len(targets) - 1
+            }
+            
+    def run_pending_sim(self, N_FRAMES=100, stiffness=1000.0, damping=0.99, dt=1e-3):
+        if not hasattr(self, 'pending_sim') or self.pending_sim is None:
+            return None
 
-        with open(in_obj, "w") as f:
-            for i in range(H):
-                for k in range(N):
-                    x, y, z = P[i, k]
-                    f.write(f"v {x} {y} {z}\n")
-            def vid(i, k): return i * N + k + 1
-            for i in range(H - 1):
-                for k in range(N - 1):
-                    f.write(f"f {vid(i,k)} {vid(i,k+1)} {vid(i+1,k+1)} {vid(i+1,k)}\n")
+        mesh_tensor = self.pending_sim["mesh_tensor"]
+        H, W, _ = mesh_tensor.shape
+        N = H * W
+        rest = 1.0 / max(H - 1, 1)
 
-        # --- Blender script. IMPORTANT: every line inside the f-string must
-        # start at column 0 so we don't write indented Python to disk. ---
-        blender_script = f'''\
-import bpy, sys, os, traceback
+        assert H <= MAX_H and W <= MAX_W, f"Mesh ({H},{W}) exceeds MAX_H/W ({MAX_H},{MAX_W})"
 
-IN_OBJ     = r"{in_obj}"
-OUT_OBJ    = r"{out_path}"
-SIM_FRAMES = {sim_frames}
+        _sim_H[None] = H
+        _sim_W[None] = W
+        _pos.fill(0)
+        _vel.fill(0)
+        _pos.from_torch(mesh_tensor)
 
-try:
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    scene = bpy.context.scene
-    scene.frame_start = 1
-    scene.frame_end   = SIM_FRAMES
+        sim_frames = []
+        for _ in range(N_FRAMES):
+            _cloth_step(stiffness, damping, dt, rest)
+            pos_tensor = _pos.to_torch(device='cuda')[:H, :W].clone().reshape(-1, 3)  # (N, 3)
 
-    # Ground
-    bpy.ops.mesh.primitive_plane_add(size=20, location=(0, 0, 0))
-    ground = bpy.context.active_object
-    bpy.ops.object.modifier_add(type='COLLISION')
-    for attr, val in [("damping", 0.5), ("friction_factor", 0.8),
-                      ("thickness_outer", 0.01), ("thickness_inner", 0.01)]:
-        if hasattr(ground.collision, attr):
-            setattr(ground.collision, attr, val)
+            quats = torch.zeros((N, 4), device='cuda')
+            quats[:, 0] = 1.0
 
-    # Import cloth
-    if hasattr(bpy.ops.wm, "obj_import"):
-        bpy.ops.wm.obj_import(filepath=IN_OBJ)
-    else:
-        bpy.ops.import_scene.obj(filepath=IN_OBJ)
-    cloth = bpy.context.selected_objects[0]
-    cloth.name = "Cloth"
-    bpy.context.view_layer.objects.active = cloth
-    bpy.ops.object.shade_smooth()
-    bpy.ops.object.modifier_add(type='CLOTH')
-    cs = cloth.modifiers["Cloth"].settings
-    col = cloth.modifiers["Cloth"].collision_settings
-    cs.mass = 0.5
-    cs.tension_stiffness = cs.compression_stiffness = cs.shear_stiffness = 40.0
-    cs.bending_stiffness = 2.0
-    cs.tension_damping = cs.compression_damping = cs.shear_damping = 5.0
-    cs.bending_damping = 2.0
-    cs.air_damping = 1.5
-    col.use_collision = True
-    col.use_self_collision = True
-    col.self_distance_min = 0.002
-    col.distance_min = 0.003
-    col.collision_quality = 4
+            scales    = torch.full((N, 3), math.log(0.005), device='cuda')
+            opacities = torch.full((N, 1), 4.0, device='cuda')
 
-    # Drive the sim
-    print("Simulating", SIM_FRAMES, "frames...")
-    for frm in range(scene.frame_start, scene.frame_end + 1):
-        scene.frame_set(frm)
-        if frm % 25 == 0:
-            print("  frame", frm)
+            sh0 = torch.zeros((N, 16, 3), device='cuda')
+            sh0[:, 0, 0] = self.base_color[0]
+            sh0[:, 0, 1] = self.base_color[1]
+            sh0[:, 0, 2] = self.base_color[2]
 
-    # Capture simulated mesh at final frame and bake it into the object
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    eval_obj = cloth.evaluated_get(depsgraph)
-    mesh_eval = bpy.data.meshes.new_from_object(eval_obj)
-    cloth.modifiers.clear()
-    cloth.data = mesh_eval
+            sim_frames.append({
+                "means":     pos_tensor,
+                "scales":    scales,
+                "quats":     quats,
+                "opacities": opacities,
+                "sh0":       sh0,
+            })
 
-    # Select just the cloth for export
-    bpy.ops.object.select_all(action='DESELECT')
-    cloth.select_set(True)
-    bpy.context.view_layer.objects.active = cloth
-
-    # --- Try Blender's OBJ exporters, then fall back to a manual writer ---
-    exported = False
-
-    if hasattr(bpy.ops.wm, "obj_export"):
-        try:
-            res = bpy.ops.wm.obj_export(
-                filepath=OUT_OBJ,
-                export_selected_objects=True,
-                export_materials=False,
-                apply_modifiers=True,
-            )
-            print("bpy.ops.wm.obj_export ->", res)
-            exported = os.path.exists(OUT_OBJ)
-        except Exception as e:
-            print("bpy.ops.wm.obj_export raised:", e)
-
-    if not exported and hasattr(bpy.ops, "export_scene") and hasattr(bpy.ops.export_scene, "obj"):
-        try:
-            res = bpy.ops.export_scene.obj(
-                filepath=OUT_OBJ,
-                use_selection=True,
-                use_materials=False,
-            )
-            print("bpy.ops.export_scene.obj ->", res)
-            exported = os.path.exists(OUT_OBJ)
-        except Exception as e:
-            print("bpy.ops.export_scene.obj raised:", e)
-
-    if not exported:
-        # Manual writer — no dependency on Blender's IO addons
-        print("Falling back to manual OBJ writer")
-        mesh = cloth.data
-        world = cloth.matrix_world
-        with open(OUT_OBJ, "w") as f:
-            f.write("# manual export from Blender cloth sim\\n")
-            for v in mesh.vertices:
-                co = world @ v.co
-                f.write("v %.6f %.6f %.6f\\n" % (co.x, co.y, co.z))
-            for poly in mesh.polygons:
-                idx = " ".join(str(i + 1) for i in poly.vertices)
-                f.write("f " + idx + "\\n")
-        exported = os.path.exists(OUT_OBJ)
-
-    if not exported:
-        print("ERROR: failed to write", OUT_OBJ)
-        sys.exit(1)
-
-    print("Wrote", OUT_OBJ)
-
-except Exception:
-    traceback.print_exc()
-    sys.exit(1)
-'''
-
-        with open(script, "w") as fh:
-            fh.write(blender_script)
-
-        cmd = [blender_exe, "--background", "--python", script]
-        print("Running:", " ".join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        print("===== Blender stdout =====")
-        print(result.stdout)
-        print("===== Blender stderr =====")
-        print(result.stderr)
-        if result.returncode != 0:
-            raise RuntimeError(f"Blender exited with code {result.returncode}")
-        if not os.path.exists(out_path):
-            raise RuntimeError(f"Blender ran but did not produce {out_path}")
-
-        print(f"Exported settled mesh to {out_path}")
-        return out_path
+        targets = [m for m in self.mesh_data if m["type"] == "user"]
+        targets[self.pending_sim["target_idx"]]["sim_frames"] = sim_frames
+        self.pending_sim = None
+        return sim_frames[-1]

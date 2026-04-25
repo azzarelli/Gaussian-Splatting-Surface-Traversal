@@ -1,29 +1,5 @@
+[Taichi] version 1.7.3, llvm 15.0.4, commit 5ec301be, linux, python 3.8.20
+[Taichi] Starting on arch=cuda
 Loading project...
   Loading ./logs/test...
 DPG loading ...
-Running: blender --background --python /tmp/cloth_export_dc696y6l/run.py
-===== Blender stdout =====
-Simulating 250 frames...
-  frame 25
-  frame 50
-  frame 75
-  frame 100
-  frame 125
-  frame 150
-  frame 175
-  frame 200
-  frame 225
-  frame 250
-Info: File exported successfully
-bpy.ops.wm.obj_export -> {'FINISHED'}
-Wrote /home/barry/Desktop/other_code/RigGS/settled.obj
-Blender 5.1.1 (hash b70da489d7f4 built 2026-04-14 01:31:31)
-OBJ import of 'mesh_in.obj' took 0.79 ms
-Writing to /home/barry/Desktop/other_code/RigGS/settled.obj
-OBJ export of 'settled.obj' took 1.43 ms
-
-Blender quit
-
-===== Blender stderr =====
-
-Exported settled mesh to /home/barry/Desktop/other_code/RigGS/settled.obj
