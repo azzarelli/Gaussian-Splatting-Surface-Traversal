@@ -221,9 +221,10 @@ class TraceGaussian(BasicGaussianModel):
         A = targets[-2]
         B = targets[-1]
 
+        N_loops = 30
         sample_heights = B["height"] - A["height"]
-        sample_heights = [A["height"] + sample_heights * (i / 10) for i in range(1, 10)]
-        sample_radius  = [A["radius"] * (i / 10) + B["radius"] * ((10 - i) / 10) for i in range(1, 10)]
+        sample_heights = [A["height"] + sample_heights * (i / N_loops) for i in range(1, N_loops)]
+        sample_radius  = [A["radius"] * (i / N_loops) + B["radius"] * ((N_loops - i) / N_loops) for i in range(1, N_loops)]
 
         for sh, sr in zip(sample_heights, sample_radius):
             ray_o, ray_d = self.generate_loop(sh, sr, A["N"], raw_return=True, pc=pc)
@@ -385,6 +386,46 @@ class TraceGaussian(BasicGaussianModel):
 
         self._rasterise_triangles(canvas, tri_px, colors)
         self.stress_map = canvas
+        
+        # ---- Recolor gaussian points based on stress ----
+        # Convert per-triangle stress -> per-vertex stress (mean over incident triangles)
+        vert_stress = torch.zeros(V, device=device)
+        vert_count = torch.zeros(V, device=device)
+        for k in range(3):
+            vert_stress.index_add_(0, triangles[:, k], stress)
+            vert_count.index_add_(0, triangles[:, k], torch.ones_like(stress))
+        vert_stress = vert_stress / vert_count.clamp(min=1)   # (V,)
+
+        # Same colour map as the heat map: blue (low) -> red (high)
+        vert_colors = torch.zeros((V, 3), device=device)
+        vert_colors[:, 0] = vert_stress
+        vert_colors[:, 2] = 1.0 - vert_stress
+
+        # Reshape back to (M_rings, N_samp, 3) so we can index per ring
+        vert_colors = vert_colors.view(M_rings, N_samp, 3)
+
+        # Walk the rings in the same order they were concatenated into `mesh`:
+        #   ring 0  = A (the older "user" loop)
+        #   rings 1..M_rings-2 = inbetweens
+        #   ring M_rings-1 = B (the newest "user" loop)
+        ring_idx = 0
+
+        # Update A's colors_int (in mesh_data)
+        A_meta = next(m for m in self.mesh_data
+                    if m["type"] == "user" and m is targets[-2])
+        self._recolor_record(A_meta, vert_colors[ring_idx])
+        ring_idx += 1
+
+        # Update inbetweens (in order of insertion)
+        for meta in self.mesh_data:
+            if meta["type"] == "inbetweens":
+                self._recolor_record(meta, vert_colors[ring_idx])
+                ring_idx += 1
+
+        # Update B's colors_int
+        B_meta = next(m for m in self.mesh_data
+                    if m["type"] == "user" and m is targets[-1])
+        self._recolor_record(B_meta, vert_colors[ring_idx])
 
 
     def _rasterise_triangles(self, canvas, tri_px, colors):
@@ -413,3 +454,22 @@ class TraceGaussian(BasicGaussianModel):
             c = 1 - a - b
             inside = (a >= 0) & (b >= 0) & (c >= 0)
             canvas[y_min:y_max + 1, x_min:x_max + 1][inside] = colors[t]
+            
+    def _recolor_record(self, meta, ring_colors):
+        """Replace the SH-DC color of every gaussian in this record with ring_colors.
+        ring_colors: (N_samp, 3) on GPU. record's colors_int has shape (N_hit, 16, 3)
+        where N_hit may be less than N_samp because some rays missed.
+        """
+        means_int, rotations_int, opacity_int, colors_int, scales_int = meta["record"]
+        N_hit = colors_int.shape[0]
+        # ring_colors has one entry per ray; we wrote stress per-vertex assuming
+        # all rays hit. If N_hit < N_samp, just take the first N_hit colours —
+        # this matches the order points were kept after the hit-mask filter,
+        # which preserves ray order.
+        new = ring_colors[:N_hit].to(colors_int.device, colors_int.dtype)
+        colors_int = colors_int * 0
+        colors_int[:, 0, :3] = new   # SH DC term, RGB
+        meta["record"] = (means_int, rotations_int, opacity_int, colors_int, scales_int)
+        
+    
+    
