@@ -15,7 +15,7 @@ import time
 from scene.cameras import Camera
 from gaussian_renderer import render, render_draw_mouse_click
 from scene.draw_gaussians import ObjectModel as DrawGaussians
-from scene.base_gaussian import TraceGaussian
+from scene.loop_gaussian import TraceGaussian
 
 to_tensor = transforms.ToTensor()  # auto converts HWC uint8 → CHW float32 in [0,1]
 
@@ -62,7 +62,7 @@ class GUIBase:
         # Main render canvas: reduced width (980x720)
         self.W, self.H = 980, 720
         # Toolbar height beneath the main canvas (this one is draggable)
-        self.TOOLBAR_H = 60
+        self.TOOLBAR_H = 35
         # Total window height
         self.TOTAL_H = self.H + self.TOOLBAR_H
         # Two secondary render canvases stacked vertically, each 512 x (TOTAL_H/2)
@@ -94,8 +94,8 @@ class GUIBase:
         self.design_state = 'add_points' #'viewing'
         self.scale_adjust = 0.07
         
-        self.loop_height=1.
-        self.loop_radius=1.
+        self.loop_height=1.35
+        self.loop_radius=1.7
 
         # Viewer settings for camera/view selection
         self.save_frame=False
@@ -135,7 +135,12 @@ class GUIBase:
             data_device=torch.device("cuda"),
             
         )
-        
+        self.stress_view = {
+            "zoom": 1.0,        # 1.0 = fit-to-canvas, >1 = zoomed in
+            "pan_x": 0.0,       # pan in stress-map pixels, from center
+            "pan_y": 0.0,
+            "drag_anchor": None,
+        }
         
         if self.gui:
             print('DPG loading ...')
@@ -164,6 +169,7 @@ class GUIBase:
             while dpg.is_dearpygui_running():
                 with torch.no_grad():
                     self.viewer_step()
+                    self.render_texture_2()
                     dpg.render_dearpygui_frame()    
 
                     
@@ -175,7 +181,61 @@ class GUIBase:
                     self.timer.start()
                     
             dpg.destroy_context()
-           
+        
+    @torch.no_grad()
+    def render_texture_2(self):
+        if self.editor["loop"]["pc"].stress_map is None:
+            return
+
+        stress = self.editor["loop"]["pc"].stress_map           # (H, W, 3) on GPU
+        H, W, _ = stress.shape
+        device = stress.device
+
+        zoom = self.stress_view["zoom"]
+        pan_x = self.stress_view["pan_x"]
+        pan_y = self.stress_view["pan_y"]
+
+        # Base fit-to-canvas scale (preserves aspect ratio)
+        fit_scale = min(self.H2 / H, self.W2 / W)
+        eff_scale = fit_scale * zoom   # canvas px per stress px
+
+        # Source crop size in stress-map pixels (this is what fills the canvas)
+        src_h = self.H2 / eff_scale
+        src_w = self.W2 / eff_scale
+
+        # Crop center in stress-map pixel coords (start at image center, shifted by pan)
+        cx = W / 2 + pan_x
+        cy = H / 2 + pan_y
+
+        # Pixel index ranges to sample
+        x0 = cx - src_w / 2
+        y0 = cy - src_h / 2
+
+        # Build a sampling grid for grid_sample (normalised to [-1, 1])
+        ys = torch.linspace(y0, y0 + src_h, self.H2, device=device)
+        xs = torch.linspace(x0, x0 + src_w, self.W2, device=device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        norm_x = (grid_x / (W - 1)) * 2 - 1
+        norm_y = (grid_y / (H - 1)) * 2 - 1
+        grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)   # (1, H2, W2, 2)
+
+        src = stress.permute(2, 0, 1).unsqueeze(0)                  # (1, 3, H, W)
+        sampled = torch.nn.functional.grid_sample(
+            src, grid,
+            mode="bilinear", padding_mode="zeros", align_corners=True,
+        ).squeeze(0)                                                # (3, H2, W2)
+
+        self.buffer_image_2 = (
+            sampled.permute(1, 2, 0)
+            .contiguous()
+            .clamp(0.0, 1.0)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        dpg.set_value("_texture_2", self.buffer_image_2)
+                
+        
     @torch.no_grad()
     def viewer_step(self):
         t0 = time.time()
@@ -197,8 +257,6 @@ class GUIBase:
                         
                 },
         )
-
-        
 
         # Display value of image at current mouse position
         try:
@@ -236,11 +294,6 @@ class GUIBase:
         dpg.set_value(
             "_texture", buffer_image
         )  # buffer must be contiguous, else seg fault!
-        
-        # Update secondary textures (currently just placeholder buffers;
-        # replace these when you wire up real second/third sources)
-        dpg.set_value("_texture_2", self.buffer_image_2)
-        dpg.set_value("_texture_3", self.buffer_image_3)
         
         dpg.set_value("_log_mouse_value", f"({[f'{v:.4f}' for v in mous_hover_value]})")
 
@@ -344,6 +397,8 @@ class GUIBase:
             pos=[0, self.H],
             no_scrollbar=True,
             no_resize=True,
+                        no_title_bar=True,
+
         ):
             def callback_main_tool_a(sender):
                 # TODO: implement
@@ -589,7 +644,40 @@ class GUIBase:
 
                     cam.R = np.stack([right, up, forward], axis=1).astype(np.float32)      
             
-        
+        def stress_zoom_callback(sender, app_data):
+            if dpg.is_item_hovered("_secondary_window"):
+                delta = app_data
+                old_zoom = self.stress_view["zoom"]
+                factor = 1.2 if delta > 0 else 1 / 1.2
+                new_zoom = max(1.0, min(20.0, old_zoom * factor))
+                self.stress_view["zoom"] = new_zoom
+
+        def stress_drag_callback(sender, app_data):
+            if dpg.is_item_hovered("_secondary_window"):
+                button, rel_x, rel_y = app_data
+                if self.editor["loop"]["pc"].stress_map is None:
+                    return
+                H, W, _ = self.editor["loop"]["pc"].stress_map.shape
+                fit_scale = min(self.H2 / H, self.W2 / W)
+                eff_scale = fit_scale * self.stress_view["zoom"]
+                # rel_x/rel_y are accumulated drag deltas in canvas pixels
+                # Convert canvas-px delta to stress-map-px delta and apply as pan
+                if self.stress_view["drag_anchor"] is None:
+                    self.stress_view["drag_anchor"] = (
+                        self.stress_view["pan_x"],
+                        self.stress_view["pan_y"],
+                        rel_x, rel_y,
+                    )
+                ax, ay, rx0, ry0 = self.stress_view["drag_anchor"]
+                dx = (rel_x - rx0) / eff_scale
+                dy = (rel_y - ry0) / eff_scale
+                self.stress_view["pan_x"] = ax - dx
+                self.stress_view["pan_y"] = ay - dy
+
+        def stress_drag_release(sender, app_data):
+            self.stress_view["drag_anchor"] = None
+            
+            
         def zoom_callback_fov(sender, app_data):
             delta = app_data  # scroll: +1 = up (zoom in), -1 = down (zoom out)
 
@@ -621,14 +709,18 @@ class GUIBase:
         def key_press_callback(sender, app_data):
             # app_data is the key code
             if app_data == dpg.mvKey_Return and self.editor["loop"]["view_flag"]:
+
                 self.editor["loop"]["pc"].set_loop(self.gaussians)
                 
         with dpg.handler_registry():
             dpg.add_mouse_wheel_handler(callback=zoom_callback_fov)
+            dpg.add_mouse_wheel_handler(callback=stress_zoom_callback)
             dpg.add_mouse_drag_handler(callback=drag_callback)
+            dpg.add_mouse_drag_handler(callback=stress_drag_callback)
+            dpg.add_mouse_release_handler(callback=stress_drag_release)
             dpg.add_mouse_move_handler(callback=mouse_hover_callback)
             dpg.add_mouse_click_handler(callback=mouse_click_callback)
-            dpg.add_key_press_handler(callback=key_press_callback)            
+            dpg.add_key_press_handler(callback=key_press_callback)     
         
         dpg.create_viewport(
             title=f"{self.runname}",
