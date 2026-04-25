@@ -58,11 +58,20 @@ class GUIBase:
         
         self.runname = name
         
-        # Set the width and height of the expected image
-        self.W, self.H = 1920, 1080
+        # ---- Layout dimensions ----
+        # Main render canvas: 720p (1280x720)
+        self.W, self.H = 1280, 720
+        # Secondary render canvas: 512x512
+        self.W2, self.H2 = 512, 512
+        # Control panel width
+        self.CTRL_W = 400
+        # Toolbar height beneath each canvas
+        self.TOOLBAR_H = 60
         
-        # Initialize the image buffer
-        self.buffer_image = np.ones((self.W, self.H, 3), dtype=np.float32)
+        # Initialize the image buffers
+        # NOTE: dpg.add_raw_texture expects (H, W, C) layout
+        self.buffer_image = np.ones((self.H, self.W, 3), dtype=np.float32)
+        self.buffer_image_2 = np.ones((self.H2, self.W2, 3), dtype=np.float32)
         
         # Other important visualization parameters
         self.vis_mode = 'render'
@@ -102,8 +111,8 @@ class GUIBase:
                     -0.9659259915351868,
                 ]], 
             T=[[0.,0.,0.]],
-            fx=1866.66, fy=1866.66,
-            cx=960., cy=540.,
+            fx=1244.44, fy=1244.44,
+            cx=640.,   cy=360.,
             
             width=self.W, height=self.H,
 
@@ -213,6 +222,10 @@ class GUIBase:
             "_texture", buffer_image
         )  # buffer must be contiguous, else seg fault!
         
+        # Update secondary texture (currently just shows the placeholder buffer;
+        # replace this when you wire up a real second source)
+        dpg.set_value("_texture_2", self.buffer_image_2)
+        
         dpg.set_value("_log_mouse_value", f"({[f'{v:.4f}' for v in mous_hover_value]})")
 
         # Add _log_view_camera
@@ -242,8 +255,9 @@ class GUIBase:
 
     
     def register_dpg(self):
-        ### register texture
+        ### register textures
         with dpg.texture_registry(show=False):
+            # Main 720p texture
             dpg.add_raw_texture(
                 self.W,
                 self.H,
@@ -251,9 +265,27 @@ class GUIBase:
                 format=dpg.mvFormat_Float_rgb,
                 tag="_texture",
             )
+            # Secondary 512x512 texture
+            dpg.add_raw_texture(
+                self.W2,
+                self.H2,
+                self.buffer_image_2,
+                format=dpg.mvFormat_Float_rgb,
+                tag="_texture_2",
+            )
+
+        # ---- Layout positions ----
+        # Main canvas at (0, 0), size W x H
+        # Main toolbar below it at (0, H), size W x TOOLBAR_H
+        # Control window to the right of main canvas at (W, 0), size CTRL_W x H
+        # Secondary canvas to the right of control at (W + CTRL_W, 0), size W2 x H2
+        # Secondary toolbar below it at (W + CTRL_W, H2), size W2 x TOOLBAR_H
+
+        TOTAL_W = self.W + self.CTRL_W + self.W2
+        TOTAL_H = max(self.H + self.TOOLBAR_H, self.H2 + self.TOOLBAR_H)
 
         ### register window
-        # the rendered image, as the primary window
+        # the main rendered image, as the primary window
         with dpg.window(
             tag="_primary_window",
             width=self.W,
@@ -265,26 +297,57 @@ class GUIBase:
         ):
             # add the texture
             dpg.add_image("_texture")
-            
-        # control window
+
+        # button theme (shared)
+        with dpg.theme() as theme_button:
+            with dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (23, 3, 18))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (51, 3, 47))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (83, 18, 83))
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 5)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 3, 3)
+
+        # ---- Toolbar beneath the main canvas ----
+        with dpg.window(
+            tag="_main_toolbar_window",
+            width=self.W,
+            height=self.TOOLBAR_H,
+            pos=[0, self.H],
+            no_move=True,
+            no_title_bar=True,
+            no_scrollbar=True,
+            no_resize=True,
+        ):
+            def callback_main_tool_a(sender):
+                # TODO: implement
+                pass
+            def callback_main_tool_b(sender):
+                # TODO: implement
+                pass
+            def callback_main_tool_c(sender):
+                # TODO: implement
+                pass
+            def callback_main_tool_d(sender):
+                # TODO: implement
+                pass
+
+            with dpg.group(horizontal=True):
+                dpg.add_text(" Main : ")
+                dpg.add_button(label="Tool A", callback=callback_main_tool_a)
+                dpg.add_button(label="Tool B", callback=callback_main_tool_b)
+                dpg.add_button(label="Tool C", callback=callback_main_tool_c)
+                dpg.add_button(label="Tool D", callback=callback_main_tool_d)
+
+        # ---- Control window (right of main canvas) ----
         with dpg.window(
             label="Control",
             tag="_control_window",
-            width=400,
-            height=self.H,
+            width=self.CTRL_W,
+            height=self.H + self.TOOLBAR_H,
             pos=[self.W, 0],
             no_move=True,
             no_title_bar=True,
         ):
-            # button theme
-            with dpg.theme() as theme_button:
-                with dpg.theme_component(dpg.mvButton):
-                    dpg.add_theme_color(dpg.mvThemeCol_Button, (23, 3, 18))
-                    dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (51, 3, 47))
-                    dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (83, 18, 83))
-                    dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 5)
-                    dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 3, 3)
-
             # timer stuff
             with dpg.group(horizontal=True):
                 dpg.add_text("Infer time: ")
@@ -392,7 +455,58 @@ class GUIBase:
                     max_value=4.,
                     callback=callback_lr_adjust,
                 )
-                
+
+            # Mouse data display moved into the control window definition
+            # so it uses the (now correct) control width.
+            with dpg.group(horizontal=True):
+                dpg.add_text(" : Mouse data : ")
+            with dpg.group(horizontal=True):
+                dpg.add_text("Position : ")
+                dpg.add_text("N/A", tag="_log_mouse_xy")
+            with dpg.group(horizontal=True):
+                dpg.add_text("Pixel Value : ")
+                dpg.add_text("N/A", tag="_log_mouse_value")
+
+        # ---- Secondary render canvas (right of control window) ----
+        with dpg.window(
+            tag="_secondary_window",
+            width=self.W2,
+            height=self.H2,
+            pos=[self.W + self.CTRL_W, 0],
+            no_move=True,
+            no_title_bar=True,
+            no_scrollbar=True,
+        ):
+            dpg.add_image("_texture_2")
+
+        # ---- Toolbar beneath the secondary canvas ----
+        with dpg.window(
+            tag="_secondary_toolbar_window",
+            width=self.W2,
+            height=self.TOOLBAR_H,
+            pos=[self.W + self.CTRL_W, self.H2],
+            no_move=True,
+            no_title_bar=True,
+            no_scrollbar=True,
+            no_resize=True,
+        ):
+            def callback_sec_tool_a(sender):
+                # TODO: implement
+                pass
+            def callback_sec_tool_b(sender):
+                # TODO: implement
+                pass
+            def callback_sec_tool_c(sender):
+                # TODO: implement
+                pass
+
+            with dpg.group(horizontal=True):
+                dpg.add_text(" Aux : ")
+                dpg.add_button(label="Load", callback=callback_sec_tool_a)
+                dpg.add_button(label="Clear", callback=callback_sec_tool_b)
+                dpg.add_button(label="Save", callback=callback_sec_tool_c)
+
+        # ---- Mouse / keyboard handlers (unchanged behavior, only main canvas) ----
         def drag_callback(sender, app_data):
             
             if dpg.is_item_hovered("_primary_window"):
@@ -434,12 +548,13 @@ class GUIBase:
         def zoom_callback_fov(sender, app_data):
             delta = app_data  # scroll: +1 = up (zoom in), -1 = down (zoom out)
 
-            if delta > 0:
-                self.camera.orbit_radius += 1
-            elif delta < 0:
-                self.camera.orbit_radius = self.camera.orbit_radius - 1 if self.camera.orbit_radius > 1 else 1
+            if dpg.is_item_hovered("_primary_window"):
+                if delta > 0:
+                    self.camera.orbit_radius += 1
+                elif delta < 0:
+                    self.camera.orbit_radius = self.camera.orbit_radius - 1 if self.camera.orbit_radius > 1 else 1
 
-            drag_callback(None, (1, 0., 0.))
+                drag_callback(None, (1, 0., 0.))
         
         
         def mouse_hover_callback(sender, app_data):
@@ -451,16 +566,6 @@ class GUIBase:
                 self.mous_loc = [int(x),int(y)]
                 dpg.set_value("_log_mouse_xy", f"({x:.1f}, {y:.1f})")
 
-        with dpg.group(horizontal=True, parent="_control_window"):
-            dpg.add_text(" : Mouse data : ")
-        # Add text in the control window to display mouse coordinates
-        with dpg.group(horizontal=True, parent="_control_window"):
-            dpg.add_text("Position : ")
-            dpg.add_text("N/A", tag="_log_mouse_xy")
-        with dpg.group(horizontal=True, parent="_control_window"):
-            dpg.add_text("Pixel Value : ")
-            dpg.add_text("N/A", tag="_log_mouse_value")
-            
         def mouse_click_callback(sender, app_data):
             # app_data: mouse button index (0=left, 1=right, 2=middle)
             if dpg.is_item_hovered("_primary_window") and self.editor["pencil"]["view_flag"]:
@@ -482,12 +587,13 @@ class GUIBase:
         
         dpg.create_viewport(
             title=f"{self.runname}",
-            width=self.W + 400,
-            height=self.H + (45 if os.name == "nt" else 0),
+            width=TOTAL_W,
+            height=TOTAL_H + (45 if os.name == "nt" else 0),
             resizable=False,
         )
 
-        ### global theme
+        ### global theme — only applied to the canvas windows so the
+        ### control + toolbars keep normal padding for buttons/sliders.
         with dpg.theme() as theme_no_padding:
             with dpg.theme_component(dpg.mvAll):
                 # set all padding to 0 to avoid scroll bar
@@ -502,13 +608,13 @@ class GUIBase:
                 )
 
         dpg.bind_item_theme("_primary_window", theme_no_padding)
+        dpg.bind_item_theme("_secondary_window", theme_no_padding)
 
-        
-        
-            
         dpg.setup_dearpygui()
 
         dpg.show_viewport()
+
+        
         
 from scipy.ndimage import distance_transform_edt
 def get_viewmat(optimized_camera_to_world):
@@ -686,5 +792,3 @@ def remove_screen_points(camera, xyz):
     remove_mask[visible_mask] = sampled_mask
 
     return remove_mask
-    
-
